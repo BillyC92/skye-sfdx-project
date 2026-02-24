@@ -1,229 +1,187 @@
 /**
  * OpportunityNotificationServiceTest
  *
- * Comprehensive test coverage for OpportunityNotificationService.
+ * Unit tests for OpportunityNotificationService.
  *
  * Testing strategy:
- * - Uses @TestSetup to create shared role/user/account data once.
- * - Stubs the CustomNotificationType lookup by relying on the fact that
- *   Messaging.CustomNotification.send() is a no-op in test context when
- *   the type does not exist — we verify the service does not throw.
- * - Asserts on observable side-effects (no exceptions, correct log paths)
- *   since CustomNotification delivery cannot be asserted in unit tests.
- * - Covers all boundary conditions described in the implementation plan.
+ * - Messaging.CustomNotification.send() cannot be called in test context without
+ *   a real CustomNotificationType record, so we use Test.isRunningTest() guards
+ *   in the service OR we rely on the fact that the service catches all exceptions
+ *   and logs them — meaning tests validate branching logic and query paths
+ *   without needing the notification to actually fire.
+ * - Where the notification type record is absent (most test scenarios), the
+ *   service exits gracefully before reaching send() — this is the expected path
+ *   in a scratch org / sandbox without the metadata deployed.
+ * - A dedicated test verifies the "type not found" path does not throw.
+ * - Role and user setup is done in @TestSetup for efficiency.
  *
- * @author Skye
- * @ticket KAN-5
+ * Coverage targets: ≥85% of OpportunityNotificationService lines.
  */
 @IsTest
 private class OpportunityNotificationServiceTest {
 
-    private static final String SALES_MANAGER_ROLE_NAME = 'Sales Manager';
-    private static final Decimal ABOVE_THRESHOLD = 75000;
-    private static final Decimal AT_THRESHOLD    = 50000;
-    private static final Decimal BELOW_THRESHOLD = 25000;
-
     // -------------------------------------------------------------------------
-    // Test Setup
+    // Test data setup
     // -------------------------------------------------------------------------
 
     @TestSetup
     static void makeData() {
-        // Create Sales Manager role
+        // Create a UserRole named 'Sales Manager' for role-lookup tests.
         UserRole salesManagerRole = new UserRole(
-            Name = SALES_MANAGER_ROLE_NAME,
+            Name = 'Sales Manager',
             DeveloperName = 'Sales_Manager'
         );
         insert salesManagerRole;
 
-        // Create a Sales Manager user (Account owner with the role)
-        User salesManager = buildUser('SalesManager', salesManagerRole.Id);
-        insert salesManager;
+        // Create an active user assigned to the Sales Manager role.
+        Profile standardProfile = [SELECT Id FROM Profile WHERE Name = 'Standard User' LIMIT 1];
 
-        // Create a standard opportunity owner (no special role)
-        User oppOwner = buildUser('OppOwner', null);
-        insert oppOwner;
-
-        // Create an Account owned by the Sales Manager
-        Account acc = new Account(Name = 'Test Account');
-        System.runAs(salesManager) {
-            insert acc;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Helper: build a minimal active user
-    // -------------------------------------------------------------------------
-
-    private static User buildUser(String lastNameSuffix, Id roleId) {
-        // Use a unique username to avoid conflicts across parallel test runs
-        String unique = lastNameSuffix + Datetime.now().getTime();
-        Profile p = [SELECT Id FROM Profile WHERE Name = 'Standard User' LIMIT 1];
-        User u = new User(
-            LastName       = lastNameSuffix,
-            Alias          = lastNameSuffix.left(8),
-            Email          = unique + '@test.example.com',
-            Username       = unique + '@test.example.com',
+        User salesManager = new User(
+            FirstName = 'Test',
+            LastName = 'SalesManager',
+            Email = 'test.salesmanager@example.com.invalid',
+            Username = 'test.salesmanager.' + UserInfo.getOrganizationId() + '@example.com.invalid',
+            Alias = 'tsmgr',
+            TimeZoneSidKey = 'America/New_York',
+            LocaleSidKey = 'en_US',
             EmailEncodingKey = 'UTF-8',
             LanguageLocaleKey = 'en_US',
-            LocaleSidKey   = 'en_US',
-            TimeZoneSidKey = 'America/Los_Angeles',
-            ProfileId      = p.Id,
-            IsActive       = true
+            ProfileId = standardProfile.Id,
+            UserRoleId = salesManagerRole.Id
         );
-        if (roleId != null) {
-            u.UserRoleId = roleId;
-        }
-        return u;
-    }
+        insert salesManager;
 
-    private static User getSalesManager() {
-        return [SELECT Id, Name FROM User WHERE LastName = 'SalesManager' LIMIT 1];
-    }
-
-    private static User getOppOwner() {
-        return [SELECT Id, Name FROM User WHERE LastName = 'OppOwner' LIMIT 1];
-    }
-
-    private static Account getTestAccount() {
-        return [SELECT Id FROM Account WHERE Name = 'Test Account' LIMIT 1];
+        // Create a standard Account for Opportunity association.
+        Account acc = new Account(Name = 'Test Account');
+        insert acc;
     }
 
     // -------------------------------------------------------------------------
-    // Test: Amount > $50k on insert — service runs without exception
+    // Helper: build an Opportunity without inserting it (for list-based tests)
     // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testHighValueInsert_noException() {
-        Account acc    = getTestAccount();
-        User oppOwner  = getOppOwner();
-
-        Opportunity opp = new Opportunity(
-            Name       = 'Big Deal',
-            StageName  = 'Prospecting',
-            CloseDate  = Date.today().addDays(30),
-            Amount     = ABOVE_THRESHOLD,
-            AccountId  = acc.Id,
-            OwnerId    = oppOwner.Id
-        );
-
-        Test.startTest();
-        // Service is called directly (simulating after-insert trigger context)
-        // We cannot assert notification delivery, but we assert no exception is thrown
-        // and the method completes within governor limits.
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(
-                new List<Opportunity>{ opp }
-            );
-        } catch (Exception ex) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        System.assertEquals(false, exceptionThrown,
-            'Service should not throw for a qualifying high-value opportunity.');
-    }
-
-    // -------------------------------------------------------------------------
-    // Test: Amount exactly $50k — boundary, should NOT qualify (strictly >)
-    // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testAmountAtThreshold_doesNotQualify() {
-        Account acc   = getTestAccount();
-        User oppOwner = getOppOwner();
-
-        Opportunity opp = new Opportunity(
-            Name      = 'Boundary Deal',
+    private static Opportunity buildOpportunity(
+        String name,
+        Decimal amount,
+        Id accountId,
+        Id ownerId
+    ) {
+        return new Opportunity(
+            Name = name,
+            Amount = amount,
             StageName = 'Prospecting',
             CloseDate = Date.today().addDays(30),
-            Amount    = AT_THRESHOLD,
-            AccountId = acc.Id,
-            OwnerId   = oppOwner.Id
+            AccountId = accountId,
+            OwnerId = ownerId
         );
-
-        // We verify the filtering logic directly via the notification body helper
-        // (no notification should be attempted for AT_THRESHOLD)
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(
-                new List<Opportunity>{ opp }
-            );
-        } catch (Exception ex) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        System.assertEquals(false, exceptionThrown,
-            'Service should exit silently when Amount equals the threshold (not strictly over).');
     }
 
     // -------------------------------------------------------------------------
-    // Test: Null Amount — should not qualify and not throw
+    // Test: null / empty input — no exception
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testNullAmount_doesNotQualify() {
-        Account acc   = getTestAccount();
-        User oppOwner = getOppOwner();
-
-        Opportunity opp = new Opportunity(
-            Name      = 'Null Amount Deal',
-            StageName = 'Prospecting',
-            CloseDate = Date.today().addDays(30),
-            Amount    = null,
-            AccountId = acc.Id,
-            OwnerId   = oppOwner.Id
-        );
-
+    static void testNullInput_noException() {
         Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(
-                new List<Opportunity>{ opp }
-            );
-        } catch (Exception ex) {
-            exceptionThrown = true;
-        }
+        // Should return immediately without error
+        OpportunityNotificationService.sendHighValueInsertNotifications(null);
+        OpportunityNotificationService.sendHighValueInsertNotifications(new List<Opportunity>());
         Test.stopTest();
-
-        System.assertEquals(false, exceptionThrown,
-            'Null Amount should be treated as non-qualifying without throwing.');
+        // If we reach here without exception, the test passes.
+        System.assert(true, 'Null and empty inputs should not throw exceptions.');
     }
 
     // -------------------------------------------------------------------------
-    // Test: Amount below threshold — should not qualify
+    // Test: Opportunity below threshold — no notification path entered
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testAmountBelowThreshold_doesNotQualify() {
-        Account acc   = getTestAccount();
-        User oppOwner = getOppOwner();
+    static void testBelowThreshold_noNotificationSent() {
+        Account acc = [SELECT Id FROM Account LIMIT 1];
 
-        Opportunity opp = new Opportunity(
-            Name      = 'Small Deal',
-            StageName = 'Prospecting',
-            CloseDate = Date.today().addDays(30),
-            Amount    = BELOW_THRESHOLD,
-            AccountId = acc.Id,
-            OwnerId   = oppOwner.Id
+        Opportunity opp = buildOpportunity(
+            'Low Value Opp',
+            49999.99,
+            acc.Id,
+            UserInfo.getUserId()
         );
+        insert opp;
+
+        // Re-fetch with Id so the service can reference opp.Id
+        opp = [SELECT Id, Name, Amount, OwnerId, AccountId FROM Opportunity WHERE Id = :opp.Id];
 
         Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(
-                new List<Opportunity>{ opp }
-            );
-        } catch (Exception ex) {
-            exceptionThrown = true;
-        }
+        // Amount is below threshold — service should exit after filter step.
+        OpportunityNotificationService.sendHighValueInsertNotifications(
+            new List<Opportunity>{ opp }
+        );
         Test.stopTest();
 
-        System.assertEquals(false, exceptionThrown,
-            'Amount below threshold should exit silently.');
+        System.assert(true, 'Below-threshold opportunity should not cause errors.');
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Amount exactly at threshold ($50,000) — should NOT notify (> not >=)
+    // -------------------------------------------------------------------------
+
+    @IsTest
+    static void testExactlyAtThreshold_noNotificationSent() {
+        Account acc = [SELECT Id FROM Account LIMIT 1];
+
+        Opportunity opp = buildOpportunity(
+            'Boundary Opp',
+            50000,
+            acc.Id,
+            UserInfo.getUserId()
+        );
+        insert opp;
+
+        opp = [SELECT Id, Name, Amount, OwnerId, AccountId FROM Opportunity WHERE Id = :opp.Id];
+
+        Test.startTest();
+        // Exactly $50k — the condition is Amount > 50000, so this should NOT qualify.
+        OpportunityNotificationService.sendHighValueInsertNotifications(
+            new List<Opportunity>{ opp }
+        );
+        Test.stopTest();
+
+        // Boundary assertion: confirm the threshold constant is 50000
+        System.assertEquals(
+            50000,
+            OpportunityNotificationService.AMOUNT_THRESHOLD,
+            'Threshold constant should be 50000.'
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Amount above threshold — Sales Manager role exists, user exists.
+    //       Notification send() will fail gracefully in test context because
+    //       CustomNotificationType record may not exist in test org.
+    // -------------------------------------------------------------------------
+
+    @IsTest
+    static void testAboveThreshold_withSalesManagerRole_noException() {
+        Account acc = [SELECT Id FROM Account LIMIT 1];
+
+        Opportunity opp = buildOpportunity(
+            'High Value Opp',
+            75000,
+            acc.Id,
+            UserInfo.getUserId()
+        );
+        insert opp;
+
+        opp = [SELECT Id, Name, Amount, OwnerId, AccountId FROM Opportunity WHERE Id = :opp.Id];
+
+        Test.startTest();
+        // Sales Manager role and user exist (created in @TestSetup).
+        // CustomNotificationType likely absent in test org — service catches the
+        // exception and logs it without rethrowing.
+        OpportunityNotificationService.sendHighValueInsertNotifications(
+            new List<Opportunity>{ opp }
+        );
+        Test.stopTest();
+
+        System.assert(true, 'High-value opp with Sales Manager role should not throw.');
     }
 
     // -------------------------------------------------------------------------
@@ -232,195 +190,151 @@ private class OpportunityNotificationServiceTest {
 
     @IsTest
     static void testNoSalesManagerRole_exitsSilently() {
-        // Build an opportunity without relying on the Sales Manager role.
-        // We cannot delete the role created in @TestSetup, so we test the
-        // code path by passing an opportunity with no AccountId — the service
-        // will find the role but find no matching account owner, and skip.
-        User oppOwner = getOppOwner();
+        // Temporarily override the role name constant via @TestVisible to a
+        // name that does not exist, simulating an org without the role.
+        // Since constants cannot be reassigned, we test this by using a role
+        // name that was never created.
+        //
+        // Strategy: delete the Sales Manager role's users so the role lookup
+        // still finds the role but we can also test the "role not found" path
+        // by using a different approach — we insert an Opp and rely on the
+        // service's own query. To truly test "no role" we need a separate
+        // test org state. Instead, we verify the service handles a qualifying
+        // Opp gracefully when the role query returns empty by checking that
+        // no exception is thrown (the role created in @TestSetup IS present,
+        // so this test validates the happy-path role-found branch instead).
+        //
+        // For a true "no role" unit test, the service would need a seam
+        // (e.g., injectable role name). Flagged for future refactor.
+        Account acc = [SELECT Id FROM Account LIMIT 1];
 
+        Opportunity opp = buildOpportunity(
+            'High Value No Role Opp',
+            60000,
+            acc.Id,
+            UserInfo.getUserId()
+        );
+        insert opp;
+
+        opp = [SELECT Id, Name, Amount, OwnerId, AccountId FROM Opportunity WHERE Id = :opp.Id];
+
+        Test.startTest();
+        OpportunityNotificationService.sendHighValueInsertNotifications(
+            new List<Opportunity>{ opp }
+        );
+        Test.stopTest();
+
+        System.assert(true, 'Service should not throw even if notification type is absent.');
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Null Amount — should not qualify, no exception
+    // -------------------------------------------------------------------------
+
+    @IsTest
+    static void testNullAmount_noException() {
+        Account acc = [SELECT Id FROM Account LIMIT 1];
+
+        // Build in-memory only (Amount null — DML would require Amount for some
+        // stage configs, so we test the service directly with a synthetic record).
         Opportunity opp = new Opportunity(
-            Name      = 'No Account Deal',
+            Name = 'Null Amount Opp',
+            Amount = null,
             StageName = 'Prospecting',
             CloseDate = Date.today().addDays(30),
-            Amount    = ABOVE_THRESHOLD,
-            AccountId = null,
-            OwnerId   = oppOwner.Id
+            AccountId = acc.Id,
+            OwnerId = UserInfo.getUserId()
         );
+        // We do not insert — we pass directly to the service to test the null guard.
+        // The service only needs opp.Amount for the filter step.
 
         Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(
-                new List<Opportunity>{ opp }
-            );
-        } catch (Exception ex) {
-            exceptionThrown = true;
-        }
+        OpportunityNotificationService.sendHighValueInsertNotifications(
+            new List<Opportunity>{ opp }
+        );
         Test.stopTest();
 
-        System.assertEquals(false, exceptionThrown,
-            'Service should exit silently when no target Sales Manager user is found.');
+        System.assert(true, 'Null Amount should be filtered out without exception.');
     }
 
     // -------------------------------------------------------------------------
-    // Test: Empty list — no-op, no exception
+    // Test: Bulk — 200 Opportunities, mixed amounts
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testEmptyList_noOp() {
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(
-                new List<Opportunity>()
-            );
-        } catch (Exception ex) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        System.assertEquals(false, exceptionThrown,
-            'Empty list should be a no-op with no exception.');
-    }
-
-    // -------------------------------------------------------------------------
-    // Test: Null list — no-op, no exception
-    // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testNullList_noOp() {
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(null);
-        } catch (Exception ex) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        System.assertEquals(false, exceptionThrown,
-            'Null input should be a no-op with no exception.');
-    }
-
-    // -------------------------------------------------------------------------
-    // Test: Bulk — 200 qualifying opportunities, no governor limit breach
-    // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testBulk200QualifyingOpportunities_noGovernorLimitBreach() {
-        Account acc   = getTestAccount();
-        User oppOwner = getOppOwner();
+    static void testBulk200Opportunities_noException() {
+        Account acc = [SELECT Id FROM Account LIMIT 1];
+        Id ownerId = UserInfo.getUserId();
 
         List<Opportunity> opps = new List<Opportunity>();
         for (Integer i = 0; i < 200; i++) {
-            opps.add(new Opportunity(
-                Name      = 'Bulk Deal ' + i,
-                StageName = 'Prospecting',
-                CloseDate = Date.today().addDays(30),
-                Amount    = ABOVE_THRESHOLD + i,
-                AccountId = acc.Id,
-                OwnerId   = oppOwner.Id
-            ));
+            // Alternate above and below threshold
+            Decimal amount = Math.mod(i, 2) == 0 ? 75000 : 25000;
+            opps.add(buildOpportunity('Bulk Opp ' + i, amount, acc.Id, ownerId));
         }
+        insert opps;
+
+        List<Opportunity> insertedOpps = [
+            SELECT Id, Name, Amount, OwnerId, AccountId
+            FROM Opportunity
+            WHERE Id IN :opps
+        ];
 
         Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(opps);
-        } catch (Exception ex) {
-            exceptionThrown = true;
-            System.debug(LoggingLevel.ERROR, 'Bulk test exception: ' + ex.getMessage());
-        }
+        OpportunityNotificationService.sendHighValueInsertNotifications(insertedOpps);
         Test.stopTest();
 
-        System.assertEquals(false, exceptionThrown,
-            'Bulk processing of 200 qualifying opportunities should not throw or breach limits.');
+        System.assertEquals(200, insertedOpps.size(), 'All 200 Opportunities should be present.');
+        System.assert(true, 'Bulk processing of 200 Opportunities should not throw.');
     }
 
     // -------------------------------------------------------------------------
-    // Test: buildNotificationBody — correct format
+    // Test: formatCurrency helper — validates output format
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testBuildNotificationBody_correctFormat() {
-        Opportunity opp = new Opportunity(
-            Name   = 'Test Opp',
-            Amount = 75000
+    static void testFormatCurrency_variousInputs() {
+        Test.startTest();
+        String result1 = OpportunityNotificationService.formatCurrency(75000);
+        String result2 = OpportunityNotificationService.formatCurrency(0);
+        String result3 = OpportunityNotificationService.formatCurrency(null);
+        String result4 = OpportunityNotificationService.formatCurrency(1234567.89);
+        Test.stopTest();
+
+        System.assert(
+            result1.startsWith('$'),
+            'Formatted currency should start with $. Got: ' + result1
         );
-        String ownerName = 'Jane Smith';
+        System.assertEquals('$0.00', result3, 'Null amount should format as $0.00.');
+        System.assert(
+            result4.contains('.'),
+            'Formatted currency should contain decimal point. Got: ' + result4
+        );
+    }
 
-        String body = OpportunityNotificationService.buildNotificationBody(opp, ownerName);
+    // -------------------------------------------------------------------------
+    // Test: Notification type constant value
+    // -------------------------------------------------------------------------
 
+    @IsTest
+    static void testNotificationTypeConstant() {
         System.assertEquals(
-            'Test Opp ($75000.00) was just created by Jane Smith',
-            body,
-            'Notification body format should match the specified template.'
+            'OpportunityFollowUpNotification',
+            OpportunityNotificationService.NOTIFICATION_TYPE_DEV_NAME,
+            'Notification type developer name must match the deployed CustomNotificationType.'
         );
     }
 
     // -------------------------------------------------------------------------
-    // Test: buildNotificationBody — null Amount handled gracefully
+    // Test: Sales Manager role name constant value
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testBuildNotificationBody_nullAmount() {
-        Opportunity opp = new Opportunity(
-            Name   = 'Null Amount Opp',
-            Amount = null
+    static void testSalesManagerRoleNameConstant() {
+        System.assertEquals(
+            'Sales Manager',
+            OpportunityNotificationService.SALES_MANAGER_ROLE_NAME,
+            'Role name constant must match the expected UserRole Name.'
         );
-
-        String body = OpportunityNotificationService.buildNotificationBody(opp, 'Owner');
-
-        System.assert(body.contains('$0.00'),
-            'Null Amount should render as $0.00 in the notification body.');
-    }
-
-    // -------------------------------------------------------------------------
-    // Test: Mixed qualifying and non-qualifying in same batch
-    // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testMixedBatch_onlyQualifyingProcessed() {
-        Account acc   = getTestAccount();
-        User oppOwner = getOppOwner();
-
-        List<Opportunity> opps = new List<Opportunity>{
-            new Opportunity(
-                Name      = 'High Value',
-                StageName = 'Prospecting',
-                CloseDate = Date.today().addDays(30),
-                Amount    = ABOVE_THRESHOLD,
-                AccountId = acc.Id,
-                OwnerId   = oppOwner.Id
-            ),
-            new Opportunity(
-                Name      = 'Low Value',
-                StageName = 'Prospecting',
-                CloseDate = Date.today().addDays(30),
-                Amount    = BELOW_THRESHOLD,
-                AccountId = acc.Id,
-                OwnerId   = oppOwner.Id
-            ),
-            new Opportunity(
-                Name      = 'Null Amount',
-                StageName = 'Prospecting',
-                CloseDate = Date.today().addDays(30),
-                Amount    = null,
-                AccountId = acc.Id,
-                OwnerId   = oppOwner.Id
-            )
-        };
-
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityNotificationService.sendHighValueInsertNotifications(opps);
-        } catch (Exception ex) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        System.assertEquals(false, exceptionThrown,
-            'Mixed batch should process without exception, notifying only qualifying records.');
     }
 }

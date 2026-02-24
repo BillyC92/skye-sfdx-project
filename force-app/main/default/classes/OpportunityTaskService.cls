@@ -1,75 +1,90 @@
 /**
  * OpportunityTaskService
  *
- * Responsible for bulk Task creation when Opportunities transition to Closed Won.
+ * Responsible for creating follow-up Tasks when an Opportunity transitions
+ * to 'Closed Won'. This service is called by OpportunityTriggerHandler and
+ * is designed to be fully bulkified — a single DML insert handles all Tasks
+ * regardless of batch size.
  *
- * Design decisions:
- * - Account owner data is pre-fetched by the caller (OpportunityTriggerHandler) to keep
- *   this service free of SOQL and fully bulkified. This class performs zero queries.
- * - If the Account owner is inactive (or no Account is linked), the Task falls back to
- *   the Opportunity owner. This ensures Tasks are never orphaned.
- * - A single DML insert handles all Tasks to respect governor limits.
- * - ActivityDate is set to CloseDate + 7 days. If CloseDate is null (should not happen
- *   on Closed Won, but defensive), today + 7 is used as a safe fallback.
+ * Task assignment logic:
+ *   - Primary owner: Account owner (if the user is active)
+ *   - Fallback owner: Opportunity owner (if Account owner is inactive or absent)
+ *
+ * Why a service class rather than inline handler logic:
+ *   Keeping this responsibility isolated makes it independently testable and
+ *   easier to extend (e.g., adding recurrence rules or custom fields later)
+ *   without touching the handler or other services.
  */
 public with sharing class OpportunityTaskService {
 
-    // Subject prefix — stored as a constant so it can be referenced in tests
-    // and changed in one place if the business requirement evolves.
+    // Surfaced as a constant so callers and tests can reference the canonical
+    // stage value without hardcoding strings in multiple places.
     @TestVisible
-    private static final String TASK_SUBJECT_PREFIX = 'Follow up: ';
+    private static final String CLOSED_WON_STAGE = 'Closed Won';
 
+    // Number of days after CloseDate to set the Task ActivityDate.
     @TestVisible
-    private static final String TASK_STATUS = 'Not Started';
-
-    @TestVisible
-    private static final Integer FOLLOW_UP_DAYS = 7;
+    private static final Integer FOLLOW_UP_DAYS_OFFSET = 7;
 
     /**
-     * Creates follow-up Tasks for a list of Closed Won Opportunities.
+     * createFollowUpTasks
      *
-     * @param opportunities  List of Opportunity records that have just become Closed Won.
-     *                       Must include: Id, Name, OwnerId, CloseDate, AccountId.
-     * @param accountOwnerMap  Map of Account Id -> User (the Account's owner).
-     *                         The User record must include: Id, IsActive.
-     *                         Caller is responsible for populating this map.
+     * Entry point called by OpportunityTriggerHandler for both insert and
+     * update contexts.
+     *
+     * @param newOpportunities  Trigger.new — the current state of each Opportunity.
+     * @param oldOpportunityMap Trigger.oldMap — previous state (null on insert).
+     * @param accountMap        Map of Account Id → Account (with Owner populated),
+     *                          pre-queried by the handler to avoid SOQL inside
+     *                          this service.
      */
     public static void createFollowUpTasks(
-        List<Opportunity> opportunities,
-        Map<Id, User> accountOwnerMap
+        List<Opportunity> newOpportunities,
+        Map<Id, Opportunity> oldOpportunityMap,
+        Map<Id, Account> accountMap
     ) {
-        if (opportunities == null || opportunities.isEmpty()) {
+        if (newOpportunities == null || newOpportunities.isEmpty()) {
             return;
         }
 
         List<Task> tasksToInsert = new List<Task>();
 
-        for (Opportunity opp : opportunities) {
-            Id assignedToId = resolveTaskOwner(opp, accountOwnerMap);
-            Date activityDate = resolveActivityDate(opp.CloseDate);
+        for (Opportunity opp : newOpportunities) {
+            // Determine whether this record represents a *new* Closed Won
+            // transition. On insert, oldOpportunityMap is null so any Closed
+            // Won record qualifies. On update, the previous stage must differ.
+            Boolean isNewClosedWon = isTransitioningToClosedWon(opp, oldOpportunityMap);
 
-            Task t = new Task(
-                Subject      = TASK_SUBJECT_PREFIX + opp.Name,
-                OwnerId      = assignedToId,
-                WhatId       = opp.Id,
-                ActivityDate = activityDate,
-                Status       = TASK_STATUS
-            );
+            if (!isNewClosedWon) {
+                continue;
+            }
 
-            tasksToInsert.add(t);
+            // Resolve the Task owner: prefer the Account owner when active,
+            // fall back to the Opportunity owner.
+            Id taskOwnerId = resolveTaskOwner(opp, accountMap);
+
+            // Guard: if for any reason we cannot determine an owner, skip
+            // rather than inserting a Task with a null OwnerId (which would
+            // fail DML and roll back the entire batch).
+            if (taskOwnerId == null) {
+                continue;
+            }
+
+            Task followUpTask = buildTask(opp, taskOwnerId);
+            tasksToInsert.add(followUpTask);
         }
 
         if (!tasksToInsert.isEmpty()) {
             try {
                 insert tasksToInsert;
             } catch (DmlException e) {
-                // Log and rethrow so the trigger can surface the error to the user.
-                // In a more mature org this would write to a custom log object.
-                System.debug(
-                    LoggingLevel.ERROR,
-                    'OpportunityTaskService.createFollowUpTasks DML failure: ' + e.getMessage()
+                // Log the error rather than swallowing it silently. In a
+                // production org this would integrate with a platform logging
+                // framework; for now we re-throw so the trigger surfaces the
+                // failure to the end user / calling process.
+                throw new OpportunityTaskServiceException(
+                    'Failed to insert follow-up Tasks: ' + e.getMessage(), e
                 );
-                throw e;
             }
         }
     }
@@ -79,33 +94,94 @@ public with sharing class OpportunityTaskService {
     // -------------------------------------------------------------------------
 
     /**
-     * Determines who the Task should be assigned to.
+     * Returns true when the Opportunity is currently 'Closed Won' AND was not
+     * already 'Closed Won' before this DML operation.
      *
-     * Rules (in priority order):
-     *  1. Account owner, if the Opportunity has an Account AND that owner is active.
-     *  2. Opportunity owner in all other cases (no Account, no owner found, inactive owner).
+     * On insert (oldOpportunityMap is null) any Closed Won record qualifies.
+     * On update, the previous stage must be something other than Closed Won.
      */
+    @TestVisible
+    private static Boolean isTransitioningToClosedWon(
+        Opportunity opp,
+        Map<Id, Opportunity> oldOpportunityMap
+    ) {
+        if (opp.StageName != CLOSED_WON_STAGE) {
+            return false;
+        }
+
+        // Insert context — no previous state to compare.
+        if (oldOpportunityMap == null) {
+            return true;
+        }
+
+        Opportunity oldOpp = oldOpportunityMap.get(opp.Id);
+
+        // Defensive: if the old record is somehow absent, treat as a new entry.
+        if (oldOpp == null) {
+            return true;
+        }
+
+        // Only create a Task when the stage is *changing* to Closed Won, not
+        // when it was already Closed Won (prevents duplicate Tasks on
+        // unrelated field edits).
+        return oldOpp.StageName != CLOSED_WON_STAGE;
+    }
+
+    /**
+     * Determines the OwnerId for the Task.
+     *
+     * Preference order:
+     *   1. Account owner — if the Account is present in accountMap and its
+     *      owner is an active user.
+     *   2. Opportunity owner — fallback for inactive Account owners or when
+     *      the Opportunity has no associated Account.
+     */
+    @TestVisible
     private static Id resolveTaskOwner(
         Opportunity opp,
-        Map<Id, User> accountOwnerMap
+        Map<Id, Account> accountMap
     ) {
-        if (opp.AccountId != null && accountOwnerMap != null) {
-            User accountOwner = accountOwnerMap.get(opp.AccountId);
-            if (accountOwner != null && accountOwner.IsActive) {
-                return accountOwner.Id;
+        if (opp.AccountId != null && accountMap != null) {
+            Account relatedAccount = accountMap.get(opp.AccountId);
+
+            if (relatedAccount != null
+                && relatedAccount.Owner != null
+                && relatedAccount.Owner.IsActive
+            ) {
+                return relatedAccount.OwnerId;
             }
         }
-        // Fall back to the Opportunity owner
+
+        // Fall back to the Opportunity owner. This will always be populated
+        // on a valid Opportunity record.
         return opp.OwnerId;
     }
 
     /**
-     * Returns CloseDate + FOLLOW_UP_DAYS.
-     * Falls back to today + FOLLOW_UP_DAYS if CloseDate is somehow null
-     * (defensive — Closed Won should always have a CloseDate).
+     * Constructs a single Task record for a Closed Won Opportunity.
+     *
+     * ActivityDate defaults to CloseDate + FOLLOW_UP_DAYS_OFFSET. If CloseDate
+     * is null (edge case on insert), ActivityDate is left null rather than
+     * throwing an exception — the Task is still created so the owner is aware.
      */
-    private static Date resolveActivityDate(Date closeDate) {
-        Date base = (closeDate != null) ? closeDate : Date.today();
-        return base.addDays(FOLLOW_UP_DAYS);
+    @TestVisible
+    private static Task buildTask(Opportunity opp, Id ownerId) {
+        Date activityDate = opp.CloseDate != null
+            ? opp.CloseDate.addDays(FOLLOW_UP_DAYS_OFFSET)
+            : null;
+
+        return new Task(
+            Subject      = 'Follow up: ' + opp.Name,
+            ActivityDate = activityDate,
+            Status       = 'Not Started',
+            WhatId       = opp.Id,
+            OwnerId      = ownerId
+        );
     }
+
+    // -------------------------------------------------------------------------
+    // Custom exception
+    // -------------------------------------------------------------------------
+
+    public class OpportunityTaskServiceException extends Exception {}
 }

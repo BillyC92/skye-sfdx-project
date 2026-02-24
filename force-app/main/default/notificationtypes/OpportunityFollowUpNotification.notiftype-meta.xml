@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomNotificationType xmlns="http://soap.sforce.com/2006/04/metadata">
+    <allowedDevices>Desktop</allowedDevices>
+    <allowedDevices>Mobile</allowedDevices>
+    <customNotifTypeName>Opportunity Follow Up Notification</customNotifTypeName>
+    <description>Notifies relevant users when a new Opportunity exceeding $50,000 is created. Used by OpportunityNotificationService to alert Sales Managers via the Messaging.CustomNotification API.</description>
+    <masterLabel>Opportunity Follow Up Notification</masterLabel>
+</CustomNotificationType>

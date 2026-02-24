@@ -1,191 +1,75 @@
 /**
  * OpportunityTriggerHandler
  *
- * Central handler for all Opportunity trigger contexts.
- * Implements the one-trigger-per-object pattern — no business logic lives here.
- * This class is responsible for:
- *   1. Identifying Closed Won transitions (old vs new StageName comparison)
- *   2. Filtering new inserts with Amount > $50k for notification
- *   3. Bulk-fetching Account owner data to avoid per-record SOQL
- *   4. Delegating to OpportunityTaskService and OpportunityNotificationService
+ * Central handler for all Opportunity trigger events. This class is the single
+ * entry point from OpportunityTrigger and is responsible for:
+ *   1. Bulkifying related data lookups (Accounts + Account owners) in one SOQL query
+ *      so downstream services never need to query Account data themselves.
+ *   2. Routing to OpportunityTaskService for Closed Won follow-up Task creation
+ *      (fires on both insert and update).
+ *   3. Routing to OpportunityNotificationService for >$50k new Opportunity
+ *      notifications (fires on insert only).
  *
- * Dependencies:
- *   - OpportunityTaskService
- *   - OpportunityNotificationService
+ * Why a handler class rather than logic in the trigger?
+ *   - Keeps the trigger file thin and version-control-friendly.
+ *   - Makes unit testing possible without DML trigger invocation.
+ *   - Allows future contexts (before delete, undelete, etc.) to be added cleanly.
  */
 public with sharing class OpportunityTriggerHandler {
 
-    // Injected via constructor to support mocking in tests
-    @TestVisible
-    private OpportunityTaskService taskService;
-
-    @TestVisible
-    private OpportunityNotificationService notificationService;
-
-    // -----------------------------------------------------------------------
-    // Constructors
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Public entry points — called directly by OpportunityTrigger
+    // -------------------------------------------------------------------------
 
     /**
-     * Default constructor — uses real service implementations.
+     * Handles after-insert logic.
+     *
+     * @param newOpps  Trigger.new cast to List<Opportunity>
      */
-    public OpportunityTriggerHandler() {
-        this.taskService = new OpportunityTaskService();
-        this.notificationService = new OpportunityNotificationService();
+    public void onAfterInsert(List<Opportunity> newOpps) {
+        Map<Id, Account> accountMap = buildAccountMap(newOpps);
+
+        // Task creation for any Opportunity inserted directly as Closed Won
+        OpportunityTaskService.createFollowUpTasks(newOpps, null, accountMap);
+
+        // Notification for Opportunities over $50k — insert only
+        OpportunityNotificationService.sendHighValueNotifications(newOpps, accountMap);
     }
 
     /**
-     * Injectable constructor for unit testing with mock services.
+     * Handles after-update logic.
+     *
+     * @param newOpps   Trigger.new cast to List<Opportunity>
+     * @param oldMap    Trigger.oldMap cast to Map<Id, Opportunity>
      */
-    @TestVisible
-    private OpportunityTriggerHandler(
-        OpportunityTaskService taskService,
-        OpportunityNotificationService notificationService
-    ) {
-        this.taskService = taskService;
-        this.notificationService = notificationService;
+    public void onAfterUpdate(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
+        Map<Id, Account> accountMap = buildAccountMap(newOpps);
+
+        // Task creation only when transitioning INTO Closed Won (not already there)
+        OpportunityTaskService.createFollowUpTasks(newOpps, oldMap, accountMap);
+
+        // Notifications are insert-only; no call to OpportunityNotificationService here
     }
 
-    // -----------------------------------------------------------------------
-    // Trigger Context Entry Points
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
 
     /**
-     * Called from OpportunityTrigger on before insert.
-     * Currently a no-op — reserved for future before-insert logic.
+     * Builds a map of Account Id -> Account (with owner details) for all
+     * Opportunities in the current batch. A single SOQL query covers the
+     * entire batch regardless of how many records are in Trigger.new.
      *
-     * @param newList  Trigger.new
+     * Owner.IsActive is fetched here so that downstream services can apply
+     * the "Account owner inactive → fall back to Opportunity owner" rule
+     * without issuing additional queries.
+     *
+     * @param opps  The list of Opportunities being processed
+     * @return      Map keyed by Account Id; Opportunities with no AccountId
+     *              will simply not find a match in the map (handled downstream)
      */
-    public void onBeforeInsert(List<Opportunity> newList) {
-        // Reserved for future before-insert logic (e.g., field defaulting)
-    }
-
-    /**
-     * Called from OpportunityTrigger on before update.
-     * Currently a no-op — reserved for future before-update logic.
-     *
-     * @param newList  Trigger.new
-     * @param oldMap   Trigger.oldMap
-     */
-    public void onBeforeUpdate(
-        List<Opportunity> newList,
-        Map<Id, Opportunity> oldMap
-    ) {
-        // Reserved for future before-update logic (e.g., field validation)
-    }
-
-    /**
-     * Called from OpportunityTrigger on after insert.
-     * Handles:
-     *   - Task creation for Closed Won inserts
-     *   - $50k custom notification for qualifying new Opportunities
-     *
-     * @param newList  Trigger.new
-     */
-    public void onAfterInsert(List<Opportunity> newList) {
-        // On insert there is no prior stage — treat all Closed Won records
-        // as a "transition" for Task creation purposes.
-        List<Opportunity> closedWonOpps = filterClosedWon(newList);
-
-        if (!closedWonOpps.isEmpty()) {
-            Map<Id, User> accountOwnerMap = fetchAccountOwners(closedWonOpps);
-            taskService.createFollowUpTasks(closedWonOpps, accountOwnerMap);
-        }
-
-        // Notification fires on insert only — no old values to compare against.
-        // Pass the full newList; the service applies its own Amount filter.
-        notificationService.sendLargeOpportunityNotifications(newList);
-    }
-
-    /**
-     * Called from OpportunityTrigger on after update.
-     * Handles:
-     *   - Task creation for Opportunities that just transitioned to Closed Won
-     *   - Notifications are intentionally NOT sent on update (insert-only requirement)
-     *
-     * @param newList  Trigger.new
-     * @param oldMap   Trigger.oldMap
-     */
-    public void onAfterUpdate(
-        List<Opportunity> newList,
-        Map<Id, Opportunity> oldMap
-    ) {
-        // Only create Tasks for records that JUST became Closed Won this update.
-        // Records already in Closed Won before this DML are excluded to prevent
-        // duplicate Task creation on subsequent edits.
-        List<Opportunity> newlyClosedWon = filterNewlyClosedWon(newList, oldMap);
-
-        if (!newlyClosedWon.isEmpty()) {
-            Map<Id, User> accountOwnerMap = fetchAccountOwners(newlyClosedWon);
-            taskService.createFollowUpTasks(newlyClosedWon, accountOwnerMap);
-        }
-
-        // Intentionally no notification call here — $50k notification is
-        // insert-only per requirements.
-    }
-
-    // -----------------------------------------------------------------------
-    // Private Helpers
-    // -----------------------------------------------------------------------
-
-    /**
-     * Returns Opportunities whose StageName is 'Closed Won'.
-     * Used for insert context where there is no prior stage to compare.
-     *
-     * @param opps  List of Opportunities to filter
-     * @return      Subset with StageName == 'Closed Won'
-     */
-    private List<Opportunity> filterClosedWon(List<Opportunity> opps) {
-        List<Opportunity> result = new List<Opportunity>();
-        for (Opportunity opp : opps) {
-            if (opp.StageName == 'Closed Won') {
-                result.add(opp);
-            }
-        }
-        return result;
-    }
-
-    /**
-     * Returns Opportunities that transitioned TO 'Closed Won' in this update.
-     * Excludes records that were already Closed Won before this DML operation
-     * to prevent duplicate Task creation on subsequent saves.
-     *
-     * @param newList  Trigger.new
-     * @param oldMap   Trigger.oldMap
-     * @return         Subset that just became Closed Won
-     */
-    private List<Opportunity> filterNewlyClosedWon(
-        List<Opportunity> newList,
-        Map<Id, Opportunity> oldMap
-    ) {
-        List<Opportunity> result = new List<Opportunity>();
-        for (Opportunity opp : newList) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
-            Boolean isNowClosedWon = (opp.StageName == 'Closed Won');
-            Boolean wasAlreadyClosedWon = (oldOpp != null && oldOpp.StageName == 'Closed Won');
-
-            if (isNowClosedWon && !wasAlreadyClosedWon) {
-                result.add(opp);
-            }
-        }
-        return result;
-    }
-
-    /**
-     * Bulk-fetches the User records for Account owners associated with the
-     * provided Opportunities. Performs a single SOQL query to retrieve
-     * Id, IsActive, and Name for each distinct Account owner.
-     *
-     * Why we query Users separately rather than using a relationship query:
-     * Trigger.new does not include related fields, so we must resolve
-     * AccountId -> Account.OwnerId -> User in two steps. This method
-     * handles both steps in bulk.
-     *
-     * @param opps  Opportunities whose Account owners we need
-     * @return      Map of Account OwnerId -> User record
-     */
-    private Map<Id, User> fetchAccountOwners(List<Opportunity> opps) {
-        // Step 1: Collect all AccountIds from the Opportunity list
+    private Map<Id, Account> buildAccountMap(List<Opportunity> opps) {
+        // Collect the distinct set of Account Ids present in this batch
         Set<Id> accountIds = new Set<Id>();
         for (Opportunity opp : opps) {
             if (opp.AccountId != null) {
@@ -193,45 +77,20 @@ public with sharing class OpportunityTriggerHandler {
             }
         }
 
+        Map<Id, Account> accountMap = new Map<Id, Account>();
         if (accountIds.isEmpty()) {
-            return new Map<Id, User>();
+            return accountMap;
         }
 
-        // Step 2: Query Accounts to get their OwnerId values
-        Map<Id, Id> accountToOwnerIdMap = new Map<Id, Id>();
+        // Single SOQL query — fetches Account owner info needed by both services
         for (Account acc : [
-            SELECT Id, OwnerId
+            SELECT Id, OwnerId, Owner.IsActive
             FROM Account
             WHERE Id IN :accountIds
         ]) {
-            accountToOwnerIdMap.put(acc.Id, acc.OwnerId);
+            accountMap.put(acc.Id, acc);
         }
 
-        // Step 3: Collect distinct Account owner User IDs
-        Set<Id> ownerIds = new Set<Id>(accountToOwnerIdMap.values());
-
-        if (ownerIds.isEmpty()) {
-            return new Map<Id, User>();
-        }
-
-        // Step 4: Query User records for active status — keyed by User Id
-        Map<Id, User> userMap = new Map<Id, User>([
-            SELECT Id, IsActive, Name
-            FROM User
-            WHERE Id IN :ownerIds
-        ]);
-
-        // Step 5: Return a map keyed by AccountId -> User (the Account's owner)
-        // This allows OpportunityTaskService to look up the owner by AccountId
-        // without needing to repeat the Account query.
-        Map<Id, User> accountOwnerMap = new Map<Id, User>();
-        for (Id accountId : accountToOwnerIdMap.keySet()) {
-            Id ownerId = accountToOwnerIdMap.get(accountId);
-            if (userMap.containsKey(ownerId)) {
-                accountOwnerMap.put(accountId, userMap.get(ownerId));
-            }
-        }
-
-        return accountOwnerMap;
+        return accountMap;
     }
 }

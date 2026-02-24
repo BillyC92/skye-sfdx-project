@@ -1,19 +1,17 @@
 /**
  * OpportunityTrigger
  *
- * Single entry-point trigger for the Opportunity object.
- * Contains NO business logic — all logic is delegated to OpportunityTriggerHandler.
+ * Single entry point for all Opportunity trigger events.
+ * Contains zero business logic — all routing and processing is delegated
+ * to OpportunityTriggerHandler to keep this file thin and maintainable.
  *
  * Contexts handled:
- *   - before insert  : field defaulting / validation before records are saved
- *   - before update  : field defaulting / validation before records are saved
- *   - after insert   : post-save logic (e.g. $50k notification on new records)
- *   - after update   : post-save logic (e.g. Closed Won task creation on stage transition)
+ *   - before insert  : field defaulting / validation before record is saved
+ *   - before update  : field defaulting / validation before record is saved
+ *   - after insert   : side-effects requiring committed record IDs (Tasks, notifications)
+ *   - after update   : side-effects on record changes (Closed Won transition Tasks)
  *
- * Why a handler class?
- *   Keeping logic out of the trigger body makes the code unit-testable in isolation,
- *   prevents the "logic buried in trigger" anti-pattern, and allows the handler to be
- *   called from other contexts (e.g. batch jobs) without re-entering trigger context.
+ * One-trigger-per-object pattern: do NOT add a second Opportunity trigger.
  */
 trigger OpportunityTrigger on Opportunity (
     before insert,
@@ -23,22 +21,11 @@ trigger OpportunityTrigger on Opportunity (
 ) {
     OpportunityTriggerHandler handler = new OpportunityTriggerHandler(
         Trigger.new,
-        Trigger.newMap,
         Trigger.old,
-        Trigger.oldMap
+        Trigger.newMap,
+        Trigger.oldMap,
+        Trigger.operationType
     );
 
-    if (Trigger.isBefore) {
-        if (Trigger.isInsert) {
-            handler.onBeforeInsert();
-        } else if (Trigger.isUpdate) {
-            handler.onBeforeUpdate();
-        }
-    } else if (Trigger.isAfter) {
-        if (Trigger.isInsert) {
-            handler.onAfterInsert();
-        } else if (Trigger.isUpdate) {
-            handler.onAfterUpdate();
-        }
-    }
+    handler.run();
 }
