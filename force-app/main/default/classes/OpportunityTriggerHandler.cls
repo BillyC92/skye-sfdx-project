@@ -1,95 +1,157 @@
 /**
  * OpportunityTriggerHandler
  *
- * Central handler for all Opportunity trigger events. This class is the single
- * entry point from OpportunityTrigger and is responsible for:
- *   1. Bulkifying related data lookups (Accounts + Account owners) in one SOQL query
- *      so downstream services never need to query Account data themselves.
- *   2. Routing to OpportunityTaskService for Closed Won follow-up Task creation
- *      (fires on both insert and update).
- *   3. Routing to OpportunityNotificationService for >$50k new Opportunity
- *      notifications (fires on insert only).
+ * Central handler class for the Opportunity trigger. Contains no business logic itself —
+ * it is responsible for:
+ *   1. Identifying which records meet criteria for downstream processing
+ *   2. Performing all bulk SOQL queries (single query per object, outside loops)
+ *   3. Delegating to OpportunityTaskService and OpportunityNotificationService
  *
- * Why a handler class rather than logic in the trigger?
- *   - Keeps the trigger file thin and version-control-friendly.
- *   - Makes unit testing possible without DML trigger invocation.
- *   - Allows future contexts (before delete, undelete, etc.) to be added cleanly.
+ * Trigger contexts handled:
+ *   - afterInsert  : Notify Sales Manager for Opportunities with Amount > 50,000
+ *   - afterUpdate  : Create follow-up Tasks for Closed Won transitions
+ *
+ * NOTE: Before-insert context is wired in the trigger but not currently used here.
+ *       It is included so the handler can be extended without modifying the trigger.
  */
 public with sharing class OpportunityTriggerHandler {
 
-    // -------------------------------------------------------------------------
-    // Public entry points — called directly by OpportunityTrigger
-    // -------------------------------------------------------------------------
+    // ─── Constants ────────────────────────────────────────────────────────────
+
+    private static final String CLOSED_WON_STAGE   = 'Closed Won';
+    private static final Decimal NOTIFICATION_THRESHOLD = 50000;
+
+    // ─── Entry Points (called by OpportunityTrigger) ──────────────────────────
 
     /**
-     * Handles after-insert logic.
+     * Handles logic that must run after Opportunity records are inserted.
+     * Currently: sends custom notifications for high-value Opportunities.
      *
-     * @param newOpps  Trigger.new cast to List<Opportunity>
+     * @param newList  Trigger.new — the newly inserted Opportunity records
      */
-    public void onAfterInsert(List<Opportunity> newOpps) {
-        Map<Id, Account> accountMap = buildAccountMap(newOpps);
+    public static void afterInsert(List<Opportunity> newList) {
+        List<Opportunity> highValueOpps = filterHighValueOpportunities(newList);
 
-        // Task creation for any Opportunity inserted directly as Closed Won
-        OpportunityTaskService.createFollowUpTasks(newOpps, null, accountMap);
+        if (highValueOpps.isEmpty()) {
+            return;
+        }
 
-        // Notification for Opportunities over $50k — insert only
-        OpportunityNotificationService.sendHighValueNotifications(newOpps, accountMap);
+        // Bulk-query Account data for all qualifying Opportunities in one SOQL
+        Map<Id, Account> accountMap = queryAccountData(highValueOpps);
+
+        OpportunityNotificationService.sendHighValueNotifications(highValueOpps, accountMap);
     }
 
     /**
-     * Handles after-update logic.
+     * Handles logic that must run after Opportunity records are updated.
+     * Currently: creates follow-up Tasks for records transitioning to Closed Won.
      *
-     * @param newOpps   Trigger.new cast to List<Opportunity>
-     * @param oldMap    Trigger.oldMap cast to Map<Id, Opportunity>
+     * @param newList   Trigger.new — updated Opportunity records
+     * @param oldMap    Trigger.oldMap — previous state of the same records
      */
-    public void onAfterUpdate(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        Map<Id, Account> accountMap = buildAccountMap(newOpps);
+    public static void afterUpdate(List<Opportunity> newList, Map<Id, Opportunity> oldMap) {
+        List<Opportunity> closedWonTransitions = filterClosedWonTransitions(newList, oldMap);
 
-        // Task creation only when transitioning INTO Closed Won (not already there)
-        OpportunityTaskService.createFollowUpTasks(newOpps, oldMap, accountMap);
+        if (closedWonTransitions.isEmpty()) {
+            return;
+        }
 
-        // Notifications are insert-only; no call to OpportunityNotificationService here
+        // Bulk-query Account data (including owner active status) in one SOQL
+        Map<Id, Account> accountMap = queryAccountData(closedWonTransitions);
+
+        OpportunityTaskService.createFollowUpTasks(closedWonTransitions, accountMap);
     }
 
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
+    // ─── Filtering Helpers ────────────────────────────────────────────────────
 
     /**
-     * Builds a map of Account Id -> Account (with owner details) for all
-     * Opportunities in the current batch. A single SOQL query covers the
-     * entire batch regardless of how many records are in Trigger.new.
+     * Returns Opportunities that are transitioning TO Closed Won in this update.
+     * A transition is defined as: new stage = 'Closed Won' AND old stage != 'Closed Won'.
+     * This prevents re-processing records that were already Closed Won.
      *
-     * Owner.IsActive is fetched here so that downstream services can apply
-     * the "Account owner inactive → fall back to Opportunity owner" rule
-     * without issuing additional queries.
-     *
-     * @param opps  The list of Opportunities being processed
-     * @return      Map keyed by Account Id; Opportunities with no AccountId
-     *              will simply not find a match in the map (handled downstream)
+     * @param newList  Updated records
+     * @param oldMap   Previous record state
+     * @return         Subset of newList that represent genuine Closed Won transitions
      */
-    private Map<Id, Account> buildAccountMap(List<Opportunity> opps) {
-        // Collect the distinct set of Account Ids present in this batch
+    @TestVisible
+    private static List<Opportunity> filterClosedWonTransitions(
+        List<Opportunity> newList,
+        Map<Id, Opportunity> oldMap
+    ) {
+        List<Opportunity> transitions = new List<Opportunity>();
+
+        for (Opportunity opp : newList) {
+            Opportunity oldOpp = oldMap.get(opp.Id);
+            Boolean isNowClosedWon  = opp.StageName == CLOSED_WON_STAGE;
+            Boolean wasNotClosedWon = oldOpp == null || oldOpp.StageName != CLOSED_WON_STAGE;
+
+            if (isNowClosedWon && wasNotClosedWon) {
+                transitions.add(opp);
+            }
+        }
+
+        return transitions;
+    }
+
+    /**
+     * Returns Opportunities with Amount strictly greater than the notification threshold.
+     * Boundary: Amount > 50,000 (exclusive — exactly 50,000 does NOT qualify).
+     * Null Amount values are treated as zero and excluded.
+     *
+     * @param opps  List of Opportunities to evaluate
+     * @return      Subset where Amount > NOTIFICATION_THRESHOLD
+     */
+    @TestVisible
+    private static List<Opportunity> filterHighValueOpportunities(List<Opportunity> opps) {
+        List<Opportunity> highValue = new List<Opportunity>();
+
+        for (Opportunity opp : opps) {
+            if (opp.Amount != null && opp.Amount > NOTIFICATION_THRESHOLD) {
+                highValue.add(opp);
+            }
+        }
+
+        return highValue;
+    }
+
+    // ─── Bulk Data Retrieval ──────────────────────────────────────────────────
+
+    /**
+     * Queries Account records (with Owner active status) for all Opportunities
+     * in the provided list. Executes a single SOQL query regardless of list size.
+     *
+     * Fields retrieved:
+     *   - Account.Id, Account.Name
+     *   - Account.OwnerId — used to assign Tasks to the Account owner
+     *   - Account.Owner.IsActive — used to determine fallback Task assignment
+     *
+     * Opportunities without an AccountId are silently excluded from the map;
+     * downstream services must handle a missing Account gracefully.
+     *
+     * @param opps  Opportunities whose Account data is needed
+     * @return      Map of Account.Id → Account (with Owner sub-query populated)
+     */
+    @TestVisible
+    private static Map<Id, Account> queryAccountData(List<Opportunity> opps) {
         Set<Id> accountIds = new Set<Id>();
+
         for (Opportunity opp : opps) {
             if (opp.AccountId != null) {
                 accountIds.add(opp.AccountId);
             }
         }
 
-        Map<Id, Account> accountMap = new Map<Id, Account>();
         if (accountIds.isEmpty()) {
-            return accountMap;
+            return new Map<Id, Account>();
         }
 
-        // Single SOQL query — fetches Account owner info needed by both services
-        for (Account acc : [
-            SELECT Id, OwnerId, Owner.IsActive
-            FROM Account
-            WHERE Id IN :accountIds
-        ]) {
-            accountMap.put(acc.Id, acc);
-        }
+        Map<Id, Account> accountMap = new Map<Id, Account>(
+            [
+                SELECT Id, Name, OwnerId, Owner.IsActive
+                FROM   Account
+                WHERE  Id IN :accountIds
+            ]
+        );
 
         return accountMap;
     }

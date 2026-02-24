@@ -1,31 +1,39 @@
 /**
  * OpportunityTaskServiceTest
  *
- * Unit tests for OpportunityTaskService. Each test method covers a distinct
- * scenario and includes meaningful assertions — not just coverage lines.
+ * Unit tests for OpportunityTaskService.
  *
- * Test data is created inline (no @TestSetup) so each test is fully
- * self-contained and failures are easy to isolate.
+ * Coverage targets:
+ *   - Task created with correct Subject, ActivityDate, WhatId, OwnerId.
+ *   - Account owner assigned when active.
+ *   - Opportunity owner used as fallback when Account owner is inactive.
+ *   - Opportunity owner used when Opportunity has no AccountId.
+ *   - Opportunity owner used when Account is absent from the map.
+ *   - Bulk operation (200 records) completes within governor limits.
+ *   - Null / empty input returns without error.
+ *   - Null CloseDate falls back to today + 7.
  */
 @IsTest
 private class OpportunityTaskServiceTest {
 
-    // -------------------------------------------------------------------------
-    // Helper factories
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Test data helpers
+    // -----------------------------------------------------------------------
 
     /**
-     * Creates a minimal active User for use as an Account or Opportunity owner.
-     * Inserts the user and returns it.
+     * Creates and inserts a minimal active User for use as an Account or
+     * Opportunity owner. Each call generates a unique username.
      */
     private static User createActiveUser(String lastName) {
         Profile p = [SELECT Id FROM Profile WHERE Name = 'Standard User' LIMIT 1];
         User u = new User(
             LastName           = lastName,
-            Email              = lastName.toLowerCase() + '@example.invalid',
-            Username           = lastName.toLowerCase() + System.currentTimeMillis() + '@example.invalid',
+            Email              = lastName.toLowerCase().replaceAll(' ', '_') + '@test.example.com',
+            Username           = lastName.toLowerCase().replaceAll(' ', '_')
+                                     + System.currentTimeMillis()
+                                     + '@test.example.com',
             Alias              = lastName.left(8),
-            TimeZoneSidKey     = 'America/New_York',
+            TimeZoneSidKey     = 'America/Los_Angeles',
             LocaleSidKey       = 'en_US',
             EmailEncodingKey   = 'UTF-8',
             LanguageLocaleKey  = 'en_US',
@@ -37,451 +45,382 @@ private class OpportunityTaskServiceTest {
     }
 
     /**
-     * Creates an Account owned by the given user and returns it.
+     * Creates and inserts an inactive User.
      */
-    private static Account createAccount(String name, Id ownerId) {
-        Account a = new Account(Name = name, OwnerId = ownerId);
-        insert a;
-        return a;
+    private static User createInactiveUser(String lastName) {
+        // Insert as active first (Salesforce does not allow inserting inactive users directly).
+        User u = createActiveUser(lastName + 'Inactive');
+        u.IsActive = false;
+        update u;
+        return u;
     }
 
     /**
-     * Creates an Opportunity with the given stage and amount.
+     * Builds an in-memory Account (not inserted) owned by the given user.
+     * The Owner sub-object is populated to mirror what the handler SOQL returns.
      */
-    private static Opportunity createOpportunity(
+    private static Account buildAccountWithOwner(Id accountId, User owner) {
+        Account acc = new Account(
+            Id      = accountId,
+            OwnerId = owner.Id
+        );
+        // Simulate the queried Owner relationship used by resolveAssignee.
+        // We use JSON deserialisation to set the read-only relationship field.
+        String json =
+            '{"attributes":{"type":"Account"},' +
+            '"Id":"' + accountId + '",' +
+            '"OwnerId":"' + owner.Id + '",' +
+            '"Owner":{"attributes":{"type":"User"},' +
+            '"Id":"' + owner.Id + '",' +
+            '"IsActive":' + owner.IsActive + '}}' ;
+        return (Account) JSON.deserialize(json, Account.class);
+    }
+
+    /**
+     * Builds a minimal Opportunity in memory (not inserted) with the supplied
+     * owner and optional AccountId.
+     */
+    private static Opportunity buildOpportunity(
         String name,
-        String stage,
-        Decimal amount,
-        Id accountId,
         Id ownerId,
+        Id accountId,
         Date closeDate
     ) {
         Opportunity opp = new Opportunity(
             Name        = name,
-            StageName   = stage,
-            Amount      = amount,
-            AccountId   = accountId,
             OwnerId     = ownerId,
-            CloseDate   = closeDate
+            AccountId   = accountId,
+            CloseDate   = closeDate,
+            StageName   = 'Closed Won',
+            Amount      = 10000
         );
-        insert opp;
         return opp;
     }
 
-    /**
-     * Builds an accountMap (Id → Account with Owner) for the given accounts.
-     * Mirrors what OpportunityTriggerHandler would supply.
-     */
-    private static Map<Id, Account> buildAccountMap(List<Account> accounts) {
-        Set<Id> accountIds = new Map<Id, Account>(accounts).keySet();
-        Map<Id, Account> result = new Map<Id, Account>(
-            [SELECT Id, OwnerId, Owner.IsActive FROM Account WHERE Id IN :accountIds]
-        );
-        return result;
-    }
+    // -----------------------------------------------------------------------
+    // Tests: resolveAssignee (via @TestVisible)
+    // -----------------------------------------------------------------------
 
-    // =========================================================================
-    // Test: single Closed Won insert creates a Task
-    // =========================================================================
     @IsTest
-    static void testInsert_ClosedWon_CreatesTask() {
-        User oppOwner = createActiveUser('OppOwner');
-        User acctOwner = createActiveUser('AcctOwner');
+    static void resolveAssignee_activeAccountOwner_returnsAccountOwner() {
+        User accOwner  = createActiveUser('AccOwner');
+        User oppOwner  = createActiveUser('OppOwner');
 
-        Account acct;
-        Opportunity opp;
+        // We need a real Account Id to use as a map key.
+        Account acc = new Account(Name = 'Test Account', OwnerId = accOwner.Id);
+        insert acc;
 
-        System.runAs(oppOwner) {
-            acct = createAccount('Test Account', acctOwner.Id);
-            opp  = createOpportunity(
-                'Deal Alpha', 'Closed Won', 10000,
-                acct.Id, oppOwner.Id, Date.today().addDays(10)
-            );
-        }
+        Account accWithOwner = buildAccountWithOwner(acc.Id, accOwner);
+        Map<Id, Account> accountMap = new Map<Id, Account>{ acc.Id => accWithOwner };
 
-        Map<Id, Account> accountMap = buildAccountMap(new List<Account>{ acct });
-
-        // Re-query opp to get a clean record as the trigger would see it.
-        List<Opportunity> newOpps = [SELECT Id, Name, StageName, OwnerId, AccountId, CloseDate FROM Opportunity WHERE Id = :opp.Id];
+        Opportunity opp = buildOpportunity('Test Opp', oppOwner.Id, acc.Id, Date.today());
 
         Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(newOpps, null, accountMap);
+        Id assignee = OpportunityTaskService.resolveAssignee(opp, accountMap);
         Test.stopTest();
 
-        List<Task> tasks = [SELECT Subject, ActivityDate, Status, WhatId, OwnerId FROM Task WHERE WhatId = :opp.Id];
-        System.assertEquals(1, tasks.size(), 'Exactly one follow-up Task should be created for a Closed Won insert');
-
-        Task t = tasks[0];
-        System.assertEquals('Follow up: Deal Alpha', t.Subject, 'Task subject should match the Opportunity name');
-        System.assertEquals(Date.today().addDays(10 + 7), t.ActivityDate, 'ActivityDate should be CloseDate + 7 days');
-        System.assertEquals('Not Started', t.Status, 'Task status should be Not Started');
-        System.assertEquals(opp.Id, t.WhatId, 'Task WhatId should reference the Opportunity');
-        // Account owner is active — Task should be assigned to account owner.
-        System.assertEquals(acctOwner.Id, t.OwnerId, 'Task owner should be the active Account owner');
-    }
-
-    // =========================================================================
-    // Test: update to Closed Won creates a Task
-    // =========================================================================
-    @IsTest
-    static void testUpdate_TransitionToClosedWon_CreatesTask() {
-        User oppOwner = createActiveUser('OppOwner2');
-        User acctOwner = createActiveUser('AcctOwner2');
-
-        Account acct;
-        Opportunity opp;
-
-        System.runAs(oppOwner) {
-            acct = createAccount('Account B', acctOwner.Id);
-            opp  = createOpportunity(
-                'Deal Beta', 'Prospecting', 20000,
-                acct.Id, oppOwner.Id, Date.today().addDays(30)
-            );
-        }
-
-        Map<Id, Account> accountMap = buildAccountMap(new List<Account>{ acct });
-
-        // Simulate the old record (stage = Prospecting)
-        Opportunity oldOpp = new Opportunity(Id = opp.Id, StageName = 'Prospecting');
-        Map<Id, Opportunity> oldMap = new Map<Id, Opportunity>{ opp.Id => oldOpp };
-
-        // Simulate the new record (stage = Closed Won)
-        Opportunity newOpp = opp.clone(true, true, false, false);
-        newOpp.StageName = 'Closed Won';
-        List<Opportunity> newOpps = new List<Opportunity>{ newOpp };
-
-        Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(newOpps, oldMap, accountMap);
-        Test.stopTest();
-
-        List<Task> tasks = [SELECT Subject, OwnerId FROM Task WHERE WhatId = :opp.Id];
-        System.assertEquals(1, tasks.size(), 'One Task should be created when transitioning to Closed Won');
-        System.assertEquals('Follow up: Deal Beta', tasks[0].Subject, 'Subject should reference the Opportunity name');
-    }
-
-    // =========================================================================
-    // Test: update where stage was already Closed Won does NOT create a Task
-    // =========================================================================
-    @IsTest
-    static void testUpdate_AlreadyClosedWon_NoTaskCreated() {
-        User oppOwner = createActiveUser('OppOwner3');
-
-        Opportunity opp;
-        System.runAs(oppOwner) {
-            opp = createOpportunity(
-                'Deal Gamma', 'Closed Won', 5000,
-                null, oppOwner.Id, Date.today()
-            );
-        }
-
-        // Both old and new are Closed Won — no transition.
-        Opportunity oldOpp = new Opportunity(Id = opp.Id, StageName = 'Closed Won');
-        Map<Id, Opportunity> oldMap = new Map<Id, Opportunity>{ opp.Id => oldOpp };
-
-        Opportunity newOpp = opp.clone(true, true, false, false);
-        newOpp.StageName = 'Closed Won';
-        newOpp.Amount = 9999; // some unrelated field change
-        List<Opportunity> newOpps = new List<Opportunity>{ newOpp };
-
-        Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(newOpps, oldMap, new Map<Id, Account>());
-        Test.stopTest();
-
-        List<Task> tasks = [SELECT Id FROM Task WHERE WhatId = :opp.Id];
-        System.assertEquals(0, tasks.size(), 'No Task should be created when the stage was already Closed Won');
-    }
-
-    // =========================================================================
-    // Test: inactive Account owner falls back to Opportunity owner
-    // =========================================================================
-    @IsTest
-    static void testInsert_InactiveAccountOwner_FallsBackToOppOwner() {
-        User oppOwner    = createActiveUser('OppOwner4');
-        User acctOwner   = createActiveUser('AcctOwner4');
-
-        Account acct;
-        Opportunity opp;
-
-        System.runAs(oppOwner) {
-            acct = createAccount('Account D', acctOwner.Id);
-            opp  = createOpportunity(
-                'Deal Delta', 'Closed Won', 15000,
-                acct.Id, oppOwner.Id, Date.today().addDays(5)
-            );
-        }
-
-        // Deactivate the account owner.
-        acctOwner.IsActive = false;
-        update acctOwner;
-
-        Map<Id, Account> accountMap = buildAccountMap(new List<Account>{ acct });
-
-        List<Opportunity> newOpps = [SELECT Id, Name, StageName, OwnerId, AccountId, CloseDate FROM Opportunity WHERE Id = :opp.Id];
-
-        Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(newOpps, null, accountMap);
-        Test.stopTest();
-
-        List<Task> tasks = [SELECT OwnerId FROM Task WHERE WhatId = :opp.Id];
-        System.assertEquals(1, tasks.size(), 'A Task should still be created when the Account owner is inactive');
-        System.assertEquals(oppOwner.Id, tasks[0].OwnerId, 'Task should fall back to the Opportunity owner when Account owner is inactive');
-    }
-
-    // =========================================================================
-    // Test: bulk insert of 200 Opportunities with mixed stages
-    // =========================================================================
-    @IsTest
-    static void testBulkInsert_MixedStages_OnlyClosedWonGetTasks() {
-        User oppOwner = createActiveUser('BulkOwner');
-
-        List<Opportunity> opps = new List<Opportunity>();
-        Integer closedWonCount = 0;
-
-        for (Integer i = 0; i < 200; i++) {
-            String stage = Math.mod(i, 2) == 0 ? 'Closed Won' : 'Prospecting';
-            if (stage == 'Closed Won') {
-                closedWonCount++;
-            }
-            opps.add(new Opportunity(
-                Name      = 'Bulk Opp ' + i,
-                StageName = stage,
-                Amount    = 1000,
-                OwnerId   = oppOwner.Id,
-                CloseDate = Date.today().addDays(i)
-            ));
-        }
-
-        System.runAs(oppOwner) {
-            insert opps;
-        }
-
-        List<Opportunity> newOpps = [
-            SELECT Id, Name, StageName, OwnerId, AccountId, CloseDate
-            FROM Opportunity
-            WHERE Id IN :opps
-        ];
-
-        Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(newOpps, null, new Map<Id, Account>());
-        Test.stopTest();
-
-        Set<Id> oppIds = new Map<Id, Opportunity>(opps).keySet();
-        List<Task> tasks = [SELECT Id FROM Task WHERE WhatId IN :oppIds];
         System.assertEquals(
-            closedWonCount,
-            tasks.size(),
-            'Exactly one Task per Closed Won Opportunity should be created in a bulk scenario'
+            accOwner.Id,
+            assignee,
+            'Active Account owner should be assigned the Task.'
         );
     }
 
-    // =========================================================================
-    // Test: null CloseDate — Task is still created with null ActivityDate
-    // =========================================================================
     @IsTest
-    static void testInsert_NullCloseDate_TaskCreatedWithNullActivityDate() {
-        User oppOwner = createActiveUser('NullDateOwner');
+    static void resolveAssignee_inactiveAccountOwner_returnsOppOwner() {
+        User inactiveOwner = createInactiveUser('InactiveAcc');
+        User oppOwner      = createActiveUser('OppOwnerFallback');
 
-        Opportunity opp;
-        System.runAs(oppOwner) {
-            // CloseDate is required by standard validation but we test the
-            // service layer in isolation using a cloned/constructed record.
-            opp = new Opportunity(
-                Id        = null,
-                Name      = 'No Close Date Deal',
-                StageName = 'Closed Won',
-                OwnerId   = oppOwner.Id,
-                CloseDate = Date.today() // required for DML; we override below
-            );
-            insert opp;
-        }
+        Account acc = new Account(Name = 'Test Account', OwnerId = inactiveOwner.Id);
+        insert acc;
 
-        // Construct a synthetic record with null CloseDate to test the service
-        // directly without triggering standard field validation.
-        Opportunity syntheticOpp = new Opportunity(
-            Id        = opp.Id,
-            Name      = 'No Close Date Deal',
-            StageName = 'Closed Won',
-            OwnerId   = oppOwner.Id,
-            CloseDate = null
+        Account accWithOwner = buildAccountWithOwner(acc.Id, inactiveOwner);
+        Map<Id, Account> accountMap = new Map<Id, Account>{ acc.Id => accWithOwner };
+
+        Opportunity opp = buildOpportunity('Test Opp', oppOwner.Id, acc.Id, Date.today());
+
+        Test.startTest();
+        Id assignee = OpportunityTaskService.resolveAssignee(opp, accountMap);
+        Test.stopTest();
+
+        System.assertEquals(
+            oppOwner.Id,
+            assignee,
+            'Inactive Account owner should fall back to Opportunity owner.'
+        );
+    }
+
+    @IsTest
+    static void resolveAssignee_noAccountId_returnsOppOwner() {
+        User oppOwner = createActiveUser('OppOwnerNoAcc');
+
+        Opportunity opp = buildOpportunity('Test Opp', oppOwner.Id, null, Date.today());
+
+        Test.startTest();
+        Id assignee = OpportunityTaskService.resolveAssignee(opp, new Map<Id, Account>());
+        Test.stopTest();
+
+        System.assertEquals(
+            oppOwner.Id,
+            assignee,
+            'Opportunity with no AccountId should fall back to Opportunity owner.'
+        );
+    }
+
+    @IsTest
+    static void resolveAssignee_accountNotInMap_returnsOppOwner() {
+        User accOwner = createActiveUser('AccOwnerMissing');
+        User oppOwner = createActiveUser('OppOwnerMapMiss');
+
+        Account acc = new Account(Name = 'Test Account', OwnerId = accOwner.Id);
+        insert acc;
+
+        // Intentionally empty map — Account not present.
+        Map<Id, Account> accountMap = new Map<Id, Account>();
+
+        Opportunity opp = buildOpportunity('Test Opp', oppOwner.Id, acc.Id, Date.today());
+
+        Test.startTest();
+        Id assignee = OpportunityTaskService.resolveAssignee(opp, accountMap);
+        Test.stopTest();
+
+        System.assertEquals(
+            oppOwner.Id,
+            assignee,
+            'Account absent from map should fall back to Opportunity owner.'
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: buildTasks (via @TestVisible)
+    // -----------------------------------------------------------------------
+
+    @IsTest
+    static void buildTasks_correctFieldValues() {
+        User oppOwner = createActiveUser('BuildTaskOwner');
+
+        Date closeDate = Date.today();
+        Opportunity opp = buildOpportunity('Deal Alpha', oppOwner.Id, null, closeDate);
+        // Assign a fake Id so the WhatId assertion is meaningful.
+        // We use JSON to set the read-only Id field.
+        opp = (Opportunity) JSON.deserialize(
+            '{"attributes":{"type":"Opportunity"},' +
+            '"Id":"006000000000001AAA",' +
+            '"Name":"Deal Alpha",' +
+            '"OwnerId":"' + oppOwner.Id + '",' +
+            '"CloseDate":"' + String.valueOf(closeDate) + '",' +
+            '"StageName":"Closed Won",' +
+            '"Amount":10000}',
+            Opportunity.class
         );
 
         Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(
-            new List<Opportunity>{ syntheticOpp },
-            null,
+        List<Task> tasks = OpportunityTaskService.buildTasks(
+            new List<Opportunity>{ opp },
             new Map<Id, Account>()
         );
         Test.stopTest();
 
-        List<Task> tasks = [SELECT ActivityDate FROM Task WHERE WhatId = :opp.Id];
-        System.assertEquals(1, tasks.size(), 'Task should be created even when CloseDate is null');
-        System.assertNull(tasks[0].ActivityDate, 'ActivityDate should be null when CloseDate is null');
+        System.assertEquals(1, tasks.size(), 'Exactly one Task should be built.');
+
+        Task t = tasks[0];
+        System.assertEquals('Follow up: Deal Alpha', t.Subject,
+            'Subject should be "Follow up: " + Opportunity Name.');
+        System.assertEquals(closeDate.addDays(7), t.ActivityDate,
+            'ActivityDate should be CloseDate + 7 days.');
+        System.assertEquals('006000000000001AAA', t.WhatId,
+            'WhatId should be the Opportunity Id.');
+        System.assertEquals(oppOwner.Id, t.OwnerId,
+            'OwnerId should be the resolved assignee.');
+        System.assertEquals('Not Started', t.Status,
+            'Status should default to Not Started.');
+        System.assertEquals('Normal', t.Priority,
+            'Priority should default to Normal.');
     }
 
-    // =========================================================================
-    // Test: null Amount — no impact on Task creation (Amount not used here)
-    // =========================================================================
     @IsTest
-    static void testInsert_NullAmount_TaskCreatedNormally() {
-        User oppOwner = createActiveUser('NullAmtOwner');
+    static void buildTasks_nullCloseDate_usesTodayPlusSeven() {
+        User oppOwner = createActiveUser('NullCloseDateOwner');
 
-        Opportunity opp;
-        System.runAs(oppOwner) {
-            opp = createOpportunity(
-                'No Amount Deal', 'Closed Won', null,
-                null, oppOwner.Id, Date.today().addDays(3)
-            );
-        }
+        Opportunity opp = (Opportunity) JSON.deserialize(
+            '{"attributes":{"type":"Opportunity"},' +
+            '"Id":"006000000000002AAA",' +
+            '"Name":"No Close Date Deal",' +
+            '"OwnerId":"' + oppOwner.Id + '",' +
+            '"StageName":"Closed Won",' +
+            '"Amount":10000}',
+            Opportunity.class
+        );
 
-        List<Opportunity> newOpps = [
-            SELECT Id, Name, StageName, OwnerId, AccountId, CloseDate
-            FROM Opportunity WHERE Id = :opp.Id
+        Test.startTest();
+        List<Task> tasks = OpportunityTaskService.buildTasks(
+            new List<Opportunity>{ opp },
+            new Map<Id, Account>()
+        );
+        Test.stopTest();
+
+        System.assertEquals(1, tasks.size());
+        System.assertEquals(
+            Date.today().addDays(7),
+            tasks[0].ActivityDate,
+            'Null CloseDate should fall back to today + 7 days.'
+        );
+    }
+
+    @IsTest
+    static void buildTasks_emptyList_returnsEmptyList() {
+        Test.startTest();
+        List<Task> tasks = OpportunityTaskService.buildTasks(
+            new List<Opportunity>(),
+            new Map<Id, Account>()
+        );
+        Test.stopTest();
+
+        System.assertNotEquals(null, tasks, 'Result should not be null.');
+        System.assertEquals(0, tasks.size(), 'Empty input should produce empty output.');
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: createFollowUpTasks (integration — real DML)
+    // -----------------------------------------------------------------------
+
+    @IsTest
+    static void createFollowUpTasks_singleRecord_taskInserted() {
+        User accOwner = createActiveUser('SingleAccOwner');
+        User oppOwner = createActiveUser('SingleOppOwner');
+
+        Account acc = new Account(Name = 'Single Test Account', OwnerId = accOwner.Id);
+        insert acc;
+
+        Opportunity opp = new Opportunity(
+            Name      = 'Single Closed Won',
+            StageName = 'Closed Won',
+            CloseDate = Date.today(),
+            OwnerId   = oppOwner.Id,
+            AccountId = acc.Id,
+            Amount    = 75000
+        );
+        insert opp;
+
+        Account accWithOwner = buildAccountWithOwner(acc.Id, accOwner);
+        Map<Id, Account> accountMap = new Map<Id, Account>{ acc.Id => accWithOwner };
+
+        Test.startTest();
+        OpportunityTaskService.createFollowUpTasks(
+            new List<Opportunity>{ opp },
+            accountMap
+        );
+        Test.stopTest();
+
+        List<Task> tasks = [
+            SELECT Subject, ActivityDate, WhatId, OwnerId
+            FROM Task
+            WHERE WhatId = :opp.Id
         ];
 
-        Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(newOpps, null, new Map<Id, Account>());
-        Test.stopTest();
-
-        List<Task> tasks = [SELECT Subject FROM Task WHERE WhatId = :opp.Id];
-        System.assertEquals(1, tasks.size(), 'Task should be created regardless of null Amount');
-        System.assertEquals('Follow up: No Amount Deal', tasks[0].Subject, 'Subject should still be set correctly');
+        System.assertEquals(1, tasks.size(), 'One Task should be created.');
+        System.assertEquals('Follow up: Single Closed Won', tasks[0].Subject);
+        System.assertEquals(Date.today().addDays(7), tasks[0].ActivityDate);
+        System.assertEquals(opp.Id, tasks[0].WhatId);
+        System.assertEquals(accOwner.Id, tasks[0].OwnerId,
+            'Active Account owner should be assigned.');
     }
 
-    // =========================================================================
-    // Test: non-Closed Won insert does NOT create a Task
-    // =========================================================================
     @IsTest
-    static void testInsert_NonClosedWon_NoTaskCreated() {
-        User oppOwner = createActiveUser('ProspectOwner');
+    static void createFollowUpTasks_inactiveAccountOwner_taskAssignedToOppOwner() {
+        User inactiveOwner = createInactiveUser('InactiveIntegration');
+        User oppOwner      = createActiveUser('OppOwnerIntegration');
 
-        Opportunity opp;
-        System.runAs(oppOwner) {
-            opp = createOpportunity(
-                'Prospect Deal', 'Prospecting', 5000,
-                null, oppOwner.Id, Date.today().addDays(60)
-            );
-        }
+        Account acc = new Account(Name = 'Inactive Owner Account', OwnerId = inactiveOwner.Id);
+        insert acc;
 
-        List<Opportunity> newOpps = [
-            SELECT Id, Name, StageName, OwnerId, AccountId, CloseDate
-            FROM Opportunity WHERE Id = :opp.Id
-        ];
+        Opportunity opp = new Opportunity(
+            Name      = 'Fallback Opp',
+            StageName = 'Closed Won',
+            CloseDate = Date.today(),
+            OwnerId   = oppOwner.Id,
+            AccountId = acc.Id,
+            Amount    = 20000
+        );
+        insert opp;
+
+        Account accWithOwner = buildAccountWithOwner(acc.Id, inactiveOwner);
+        Map<Id, Account> accountMap = new Map<Id, Account>{ acc.Id => accWithOwner };
 
         Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(newOpps, null, new Map<Id, Account>());
-        Test.stopTest();
-
-        List<Task> tasks = [SELECT Id FROM Task WHERE WhatId = :opp.Id];
-        System.assertEquals(0, tasks.size(), 'No Task should be created for a non-Closed Won Opportunity');
-    }
-
-    // =========================================================================
-    // Test: empty list input — no error thrown, no DML
-    // =========================================================================
-    @IsTest
-    static void testEmptyList_NoErrorThrown() {
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityTaskService.createFollowUpTasks(
-                new List<Opportunity>(),
-                null,
-                new Map<Id, Account>()
-            );
-        } catch (Exception e) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        System.assertFalse(exceptionThrown, 'No exception should be thrown for an empty Opportunity list');
-    }
-
-    // =========================================================================
-    // Test: null list input — no error thrown
-    // =========================================================================
-    @IsTest
-    static void testNullList_NoErrorThrown() {
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            OpportunityTaskService.createFollowUpTasks(null, null, null);
-        } catch (Exception e) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        System.assertFalse(exceptionThrown, 'No exception should be thrown for a null Opportunity list');
-    }
-
-    // =========================================================================
-    // Test: Opportunity with no Account — falls back to Opportunity owner
-    // =========================================================================
-    @IsTest
-    static void testInsert_NoAccount_UsesOppOwner() {
-        User oppOwner = createActiveUser('NoAcctOwner');
-
-        Opportunity opp;
-        System.runAs(oppOwner) {
-            opp = createOpportunity(
-                'No Account Deal', 'Closed Won', 8000,
-                null, oppOwner.Id, Date.today().addDays(14)
-            );
-        }
-
-        List<Opportunity> newOpps = [
-            SELECT Id, Name, StageName, OwnerId, AccountId, CloseDate
-            FROM Opportunity WHERE Id = :opp.Id
-        ];
-
-        Test.startTest();
-        OpportunityTaskService.createFollowUpTasks(newOpps, null, new Map<Id, Account>());
+        OpportunityTaskService.createFollowUpTasks(
+            new List<Opportunity>{ opp },
+            accountMap
+        );
         Test.stopTest();
 
         List<Task> tasks = [SELECT OwnerId FROM Task WHERE WhatId = :opp.Id];
-        System.assertEquals(1, tasks.size(), 'Task should be created for Opportunity with no Account');
-        System.assertEquals(oppOwner.Id, tasks[0].OwnerId, 'Task owner should be the Opportunity owner when no Account is present');
+        System.assertEquals(1, tasks.size());
+        System.assertEquals(oppOwner.Id, tasks[0].OwnerId,
+            'Inactive Account owner should fall back to Opportunity owner.');
     }
 
-    // =========================================================================
-    // Test: private helper isTransitioningToClosedWon — direct unit coverage
-    // =========================================================================
     @IsTest
-    static void testIsTransitioningToClosedWon_DirectCoverage() {
-        Opportunity opp = new Opportunity(
-            Id        = null,
-            StageName = 'Closed Won'
-        );
+    static void createFollowUpTasks_bulkTwoHundredRecords_allTasksInserted() {
+        User oppOwner = createActiveUser('BulkOppOwner');
+        User accOwner = createActiveUser('BulkAccOwner');
 
-        // Insert context (null oldMap) — should return true.
-        System.assert(
-            OpportunityTaskService.isTransitioningToClosedWon(opp, null),
-            'Should return true for Closed Won on insert'
-        );
+        Account acc = new Account(Name = 'Bulk Account', OwnerId = accOwner.Id);
+        insert acc;
 
-        // Update context — was Prospecting, now Closed Won — should return true.
-        Opportunity oldOpp = new Opportunity(StageName = 'Prospecting');
-        // We need an Id to key the map; use a fake one.
-        Id fakeId = '0060000000000001AAA';
-        opp.Id = fakeId;
-        oldOpp.Id = fakeId;
-        Map<Id, Opportunity> oldMap = new Map<Id, Opportunity>{ fakeId => oldOpp };
-        System.assert(
-            OpportunityTaskService.isTransitioningToClosedWon(opp, oldMap),
-            'Should return true when transitioning from Prospecting to Closed Won'
-        );
+        List<Opportunity> opps = new List<Opportunity>();
+        for (Integer i = 0; i < 200; i++) {
+            opps.add(new Opportunity(
+                Name      = 'Bulk Opp ' + i,
+                StageName = 'Closed Won',
+                CloseDate = Date.today(),
+                OwnerId   = oppOwner.Id,
+                AccountId = acc.Id,
+                Amount    = 10000
+            ));
+        }
+        insert opps;
 
-        // Update context — was already Closed Won — should return false.
-        oldOpp.StageName = 'Closed Won';
-        System.assert(
-            !OpportunityTaskService.isTransitioningToClosedWon(opp, oldMap),
-            'Should return false when stage was already Closed Won'
-        );
+        Account accWithOwner = buildAccountWithOwner(acc.Id, accOwner);
+        Map<Id, Account> accountMap = new Map<Id, Account>{ acc.Id => accWithOwner };
 
-        // Non-Closed Won stage — should return false regardless.
-        opp.StageName = 'Negotiation/Review';
-        System.assert(
-            !OpportunityTaskService.isTransitioningToClosedWon(opp, null),
-            'Should return false for a non-Closed Won stage'
-        );
+        Test.startTest();
+        OpportunityTaskService.createFollowUpTasks(opps, accountMap);
+        Test.stopTest();
+
+        Integer taskCount = [
+            SELECT COUNT()
+            FROM Task
+            WHERE WhatId IN :opps
+        ];
+        System.assertEquals(200, taskCount,
+            'All 200 Opportunities should have a corresponding Task.');
+    }
+
+    @IsTest
+    static void createFollowUpTasks_nullInput_noException() {
+        Test.startTest();
+        try {
+            OpportunityTaskService.createFollowUpTasks(null, null);
+            System.assert(true, 'Null input should not throw an exception.');
+        } catch (Exception ex) {
+            System.assert(false, 'Null input threw an unexpected exception: ' + ex.getMessage());
+        }
+        Test.stopTest();
+    }
+
+    @IsTest
+    static void createFollowUpTasks_emptyList_noException() {
+        Test.startTest();
+        try {
+            OpportunityTaskService.createFollowUpTasks(
+                new List<Opportunity>(),
+                new Map<Id, Account>()
+            );
+            System.assert(true, 'Empty list should not throw an exception.');
+        } catch (Exception ex) {
+            System.assert(false, 'Empty list threw an unexpected exception: ' + ex.getMessage());
+        }
+        Test.stopTest();
     }
 }
