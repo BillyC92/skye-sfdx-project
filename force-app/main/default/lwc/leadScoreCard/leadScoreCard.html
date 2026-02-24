@@ -1,0 +1,75 @@
+<template>
+    <lightning-card title="Lead Score" icon-name="standard:lead">
+        <template if:true={isLoading}>
+            <div class="slds-align_absolute-center slds-p-around_large">
+                <lightning-spinner alternative-text="Calculating score..." size="medium"></lightning-spinner>
+            </div>
+        </template>
+
+        <template if:false={isLoading}>
+            <template if:true={hasScore}>
+                <div class="slds-p-around_medium">
+                    <!-- Score Badge -->
+                    <div class="slds-grid slds-grid_align-center slds-m-bottom_medium">
+                        <div class={scoreContainerClass}>
+                            <span class="score-number slds-text-heading_large">{score}</span>
+                            <span class="score-label slds-text-body_small">/100</span>
+                        </div>
+                    </div>
+
+                    <!-- Tier Label -->
+                    <div class="slds-text-align_center slds-m-bottom_medium">
+                        <lightning-badge label={tierLabel} class={tierBadgeClass}></lightning-badge>
+                    </div>
+
+                    <!-- Score Breakdown -->
+                    <div class="slds-grid slds-wrap slds-gutters_x-small">
+                        <div class="slds-col slds-size_1-of-2 slds-p-bottom_small">
+                            <div class="slds-text-title_caps slds-text-color_weak">Company Fit</div>
+                            <lightning-progress-bar value={companyFitPercent} size="small"
+                                variant={companyFitVariant}></lightning-progress-bar>
+                        </div>
+                        <div class="slds-col slds-size_1-of-2 slds-p-bottom_small">
+                            <div class="slds-text-title_caps slds-text-color_weak">Industry</div>
+                            <lightning-progress-bar value={industryFitPercent} size="small"
+                                variant={industryFitVariant}></lightning-progress-bar>
+                        </div>
+                        <div class="slds-col slds-size_1-of-2 slds-p-bottom_small">
+                            <div class="slds-text-title_caps slds-text-color_weak">Engagement</div>
+                            <lightning-progress-bar value={engagementPercent} size="small"
+                                variant={engagementVariant}></lightning-progress-bar>
+                        </div>
+                        <div class="slds-col slds-size_1-of-2 slds-p-bottom_small">
+                            <div class="slds-text-title_caps slds-text-color_weak">Budget</div>
+                            <lightning-progress-bar value={budgetPercent} size="small"
+                                variant={budgetVariant}></lightning-progress-bar>
+                        </div>
+                    </div>
+
+                    <!-- Recommendation -->
+                    <template if:true={recommendation}>
+                        <div class="slds-box slds-theme_shade slds-m-top_small">
+                            <p class="slds-text-body_small">
+                                <lightning-icon icon-name="utility:info" size="xx-small"
+                                    class="slds-m-right_xx-small"></lightning-icon>
+                                {recommendation}
+                            </p>
+                        </div>
+                    </template>
+                </div>
+            </template>
+
+            <template if:false={hasScore}>
+                <div class="slds-align_absolute-center slds-p-around_large slds-text-color_weak">
+                    <p>No score available for this lead.</p>
+                </div>
+            </template>
+        </template>
+
+        <!-- Refresh Button -->
+        <div slot="actions">
+            <lightning-button-icon icon-name="utility:refresh" alternative-text="Recalculate Score"
+                onclick={handleRefresh} variant="border-filled"></lightning-button-icon>
+        </div>
+    </lightning-card>
+</template>
