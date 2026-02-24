@@ -1,251 +1,237 @@
 /**
- * @description Trigger handler for Opportunity events. Implements stage-transition
- *              validation, amount-threshold enforcement, and notification dispatch
- *              for the Acme Corp sales process.
+ * OpportunityTriggerHandler
  *
- *              Follows the single-trigger-per-object pattern with a dedicated handler.
+ * Central handler for all Opportunity trigger contexts.
+ * Implements the one-trigger-per-object pattern — no business logic lives here.
+ * This class is responsible for:
+ *   1. Identifying Closed Won transitions (old vs new StageName comparison)
+ *   2. Filtering new inserts with Amount > $50k for notification
+ *   3. Bulk-fetching Account owner data to avoid per-record SOQL
+ *   4. Delegating to OpportunityTaskService and OpportunityNotificationService
  *
- * @author  Skieward Consulting
- * @date    2024-11-15
- * @group   Opportunity Management
+ * Dependencies:
+ *   - OpportunityTaskService
+ *   - OpportunityNotificationService
  */
 public with sharing class OpportunityTriggerHandler {
 
-    // ---------------------------------------------------------------------------
-    // Constants
-    // ---------------------------------------------------------------------------
+    // Injected via constructor to support mocking in tests
+    @TestVisible
+    private OpportunityTaskService taskService;
 
-    private static final Decimal EXECUTIVE_APPROVAL_THRESHOLD = 500000.00;
-    private static final Decimal LARGE_DEAL_THRESHOLD         = 100000.00;
+    @TestVisible
+    private OpportunityNotificationService notificationService;
 
-    /** Allowed forward stage transitions (simplified Acme Corp sales process). */
-    private static final Map<String, Set<String>> VALID_STAGE_TRANSITIONS = new Map<String, Set<String>>{
-        'Prospecting'           => new Set<String>{ 'Qualification', 'Closed Lost' },
-        'Qualification'         => new Set<String>{ 'Needs Analysis', 'Closed Lost' },
-        'Needs Analysis'        => new Set<String>{ 'Value Proposition', 'Closed Lost' },
-        'Value Proposition'     => new Set<String>{ 'Id. Decision Makers', 'Closed Lost' },
-        'Id. Decision Makers'   => new Set<String>{ 'Perception Analysis', 'Closed Lost' },
-        'Perception Analysis'   => new Set<String>{ 'Proposal/Price Quote', 'Closed Lost' },
-        'Proposal/Price Quote'  => new Set<String>{ 'Negotiation/Review', 'Closed Lost' },
-        'Negotiation/Review'    => new Set<String>{ 'Closed Won', 'Closed Lost' }
-    };
-
-    // ---------------------------------------------------------------------------
-    // Trigger Entry Points
-    // ---------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Constructors
+    // -----------------------------------------------------------------------
 
     /**
-     * @description Executes before-insert logic.
-     * @param newOpps Trigger.new list.
+     * Default constructor — uses real service implementations.
      */
-    public void handleBeforeInsert(List<Opportunity> newOpps) {
-        stampDefaultFields(newOpps);
-        validateAmountThresholds(newOpps);
+    public OpportunityTriggerHandler() {
+        this.taskService = new OpportunityTaskService();
+        this.notificationService = new OpportunityNotificationService();
     }
 
     /**
-     * @description Executes before-update logic.
-     * @param newOpps Trigger.new list.
-     * @param oldMap  Trigger.oldMap.
-     */
-    public void handleBeforeUpdate(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        validateStageTransitions(newOpps, oldMap);
-        validateAmountThresholds(newOpps);
-        flagLargeDealChanges(newOpps, oldMap);
-    }
-
-    /**
-     * @description Executes after-update logic (notifications, chatter posts).
-     * @param newOpps Trigger.new list.
-     * @param oldMap  Trigger.oldMap.
-     */
-    public void handleAfterUpdate(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        notifyOnClosedWon(newOpps, oldMap);
-        createStageChangeHistoryTasks(newOpps, oldMap);
-    }
-
-    // ---------------------------------------------------------------------------
-    // Before-Insert Helpers
-    // ---------------------------------------------------------------------------
-
-    /**
-     * @description Sets sensible defaults on new Opportunity records when values
-     *              are not provided by the user.
-     */
-    private void stampDefaultFields(List<Opportunity> newOpps) {
-        for (Opportunity opp : newOpps) {
-            if (opp.StageName == null) {
-                opp.StageName = 'Prospecting';
-            }
-
-            if (opp.CloseDate == null) {
-                opp.CloseDate = Date.today().addDays(90);
-            }
-
-            if (opp.LeadSource == null) {
-                opp.LeadSource = 'Web';
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // Before-Update Helpers
-    // ---------------------------------------------------------------------------
-
-    /**
-     * @description Validates that stage transitions follow the allowed Acme Corp
-     *              sales methodology. Prevents skipping stages or moving backwards
-     *              unless the target is "Closed Lost".
+     * Injectable constructor for unit testing with mock services.
      */
     @TestVisible
-    private void validateStageTransitions(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        for (Opportunity opp : newOpps) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
+    private OpportunityTriggerHandler(
+        OpportunityTaskService taskService,
+        OpportunityNotificationService notificationService
+    ) {
+        this.taskService = taskService;
+        this.notificationService = notificationService;
+    }
 
-            if (opp.StageName == oldOpp.StageName) {
-                continue;
-            }
+    // -----------------------------------------------------------------------
+    // Trigger Context Entry Points
+    // -----------------------------------------------------------------------
 
-            // Allow admin overrides via custom permission (simplified: check profile)
-            if (isAdminBypass()) {
-                continue;
-            }
-
-            Set<String> allowedNextStages = VALID_STAGE_TRANSITIONS.get(oldOpp.StageName);
-
-            if (allowedNextStages == null) {
-                // Current stage is terminal (Closed Won / Closed Lost) — no transitions allowed
-                opp.StageName.addError(
-                    'Opportunity in stage "' + oldOpp.StageName + '" cannot be moved to another stage. ' +
-                    'Please clone the record if you need a new opportunity.'
-                );
-                continue;
-            }
-
-            if (!allowedNextStages.contains(opp.StageName)) {
-                opp.StageName.addError(
-                    'Invalid stage transition from "' + oldOpp.StageName + '" to "' +
-                    opp.StageName + '". Allowed next stages: ' +
-                    String.join(new List<String>(allowedNextStages), ', ') + '.'
-                );
-            }
-        }
+    /**
+     * Called from OpportunityTrigger on before insert.
+     * Currently a no-op — reserved for future before-insert logic.
+     *
+     * @param newList  Trigger.new
+     */
+    public void onBeforeInsert(List<Opportunity> newList) {
+        // Reserved for future before-insert logic (e.g., field defaulting)
     }
 
     /**
-     * @description Enforces amount thresholds. Opportunities above the executive
-     *              approval threshold require the Description field to be populated
-     *              (as a proxy for justification notes).
+     * Called from OpportunityTrigger on before update.
+     * Currently a no-op — reserved for future before-update logic.
+     *
+     * @param newList  Trigger.new
+     * @param oldMap   Trigger.oldMap
      */
-    private void validateAmountThresholds(List<Opportunity> opps) {
+    public void onBeforeUpdate(
+        List<Opportunity> newList,
+        Map<Id, Opportunity> oldMap
+    ) {
+        // Reserved for future before-update logic (e.g., field validation)
+    }
+
+    /**
+     * Called from OpportunityTrigger on after insert.
+     * Handles:
+     *   - Task creation for Closed Won inserts
+     *   - $50k custom notification for qualifying new Opportunities
+     *
+     * @param newList  Trigger.new
+     */
+    public void onAfterInsert(List<Opportunity> newList) {
+        // On insert there is no prior stage — treat all Closed Won records
+        // as a "transition" for Task creation purposes.
+        List<Opportunity> closedWonOpps = filterClosedWon(newList);
+
+        if (!closedWonOpps.isEmpty()) {
+            Map<Id, User> accountOwnerMap = fetchAccountOwners(closedWonOpps);
+            taskService.createFollowUpTasks(closedWonOpps, accountOwnerMap);
+        }
+
+        // Notification fires on insert only — no old values to compare against.
+        // Pass the full newList; the service applies its own Amount filter.
+        notificationService.sendLargeOpportunityNotifications(newList);
+    }
+
+    /**
+     * Called from OpportunityTrigger on after update.
+     * Handles:
+     *   - Task creation for Opportunities that just transitioned to Closed Won
+     *   - Notifications are intentionally NOT sent on update (insert-only requirement)
+     *
+     * @param newList  Trigger.new
+     * @param oldMap   Trigger.oldMap
+     */
+    public void onAfterUpdate(
+        List<Opportunity> newList,
+        Map<Id, Opportunity> oldMap
+    ) {
+        // Only create Tasks for records that JUST became Closed Won this update.
+        // Records already in Closed Won before this DML are excluded to prevent
+        // duplicate Task creation on subsequent edits.
+        List<Opportunity> newlyClosedWon = filterNewlyClosedWon(newList, oldMap);
+
+        if (!newlyClosedWon.isEmpty()) {
+            Map<Id, User> accountOwnerMap = fetchAccountOwners(newlyClosedWon);
+            taskService.createFollowUpTasks(newlyClosedWon, accountOwnerMap);
+        }
+
+        // Intentionally no notification call here — $50k notification is
+        // insert-only per requirements.
+    }
+
+    // -----------------------------------------------------------------------
+    // Private Helpers
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns Opportunities whose StageName is 'Closed Won'.
+     * Used for insert context where there is no prior stage to compare.
+     *
+     * @param opps  List of Opportunities to filter
+     * @return      Subset with StageName == 'Closed Won'
+     */
+    private List<Opportunity> filterClosedWon(List<Opportunity> opps) {
+        List<Opportunity> result = new List<Opportunity>();
         for (Opportunity opp : opps) {
-            if (opp.Amount != null && opp.Amount >= EXECUTIVE_APPROVAL_THRESHOLD) {
-                if (String.isBlank(opp.Description)) {
-                    opp.Description.addError(
-                        'Opportunities of $' + EXECUTIVE_APPROVAL_THRESHOLD.setScale(0).toPlainString() +
-                        ' or more require a justification in the Description field.'
-                    );
-                }
+            if (opp.StageName == 'Closed Won') {
+                result.add(opp);
             }
         }
+        return result;
     }
 
     /**
-     * @description Flags opportunities where the Amount increased by more than 20%
-     *              in a single edit — adds a note to the Description for audit trail.
+     * Returns Opportunities that transitioned TO 'Closed Won' in this update.
+     * Excludes records that were already Closed Won before this DML operation
+     * to prevent duplicate Task creation on subsequent saves.
+     *
+     * @param newList  Trigger.new
+     * @param oldMap   Trigger.oldMap
+     * @return         Subset that just became Closed Won
      */
-    private void flagLargeDealChanges(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        for (Opportunity opp : newOpps) {
+    private List<Opportunity> filterNewlyClosedWon(
+        List<Opportunity> newList,
+        Map<Id, Opportunity> oldMap
+    ) {
+        List<Opportunity> result = new List<Opportunity>();
+        for (Opportunity opp : newList) {
             Opportunity oldOpp = oldMap.get(opp.Id);
+            Boolean isNowClosedWon = (opp.StageName == 'Closed Won');
+            Boolean wasAlreadyClosedWon = (oldOpp != null && oldOpp.StageName == 'Closed Won');
 
-            if (opp.Amount == null || oldOpp.Amount == null || oldOpp.Amount == 0) {
-                continue;
-            }
-
-            Decimal percentChange = ((opp.Amount - oldOpp.Amount) / oldOpp.Amount) * 100;
-
-            if (percentChange > 20) {
-                String auditNote = '\n[Skieward Audit] Amount increased by ' +
-                    percentChange.setScale(1) + '% on ' + String.valueOf(Date.today()) + '.';
-
-                opp.Description = (String.isNotBlank(opp.Description) ? opp.Description : '') + auditNote;
+            if (isNowClosedWon && !wasAlreadyClosedWon) {
+                result.add(opp);
             }
         }
-    }
-
-    // ---------------------------------------------------------------------------
-    // After-Update Helpers
-    // ---------------------------------------------------------------------------
-
-    /**
-     * @description Sends a platform event or email notification when an Opportunity
-     *              moves to "Closed Won". In this implementation we create a Task
-     *              assigned to the Opportunity Owner for follow-up.
-     */
-    private void notifyOnClosedWon(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        List<Task> followUpTasks = new List<Task>();
-
-        for (Opportunity opp : newOpps) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
-
-            if (opp.StageName == 'Closed Won' && oldOpp.StageName != 'Closed Won') {
-                followUpTasks.add(new Task(
-                    Subject     = 'Closed Won Follow-Up: ' + opp.Name,
-                    WhatId      = opp.Id,
-                    OwnerId     = opp.OwnerId,
-                    Status      = 'Not Started',
-                    Priority    = opp.Amount >= LARGE_DEAL_THRESHOLD ? 'High' : 'Normal',
-                    ActivityDate = Date.today().addDays(3),
-                    Description = 'Congratulations on closing ' + opp.Name + '! ' +
-                                  'Please initiate the onboarding process within 3 business days.'
-                ));
-            }
-        }
-
-        if (!followUpTasks.isEmpty()) {
-            insert followUpTasks;
-        }
+        return result;
     }
 
     /**
-     * @description Creates a lightweight Task record to log every stage change,
-     *              providing a queryable audit trail without custom objects.
+     * Bulk-fetches the User records for Account owners associated with the
+     * provided Opportunities. Performs a single SOQL query to retrieve
+     * Id, IsActive, and Name for each distinct Account owner.
+     *
+     * Why we query Users separately rather than using a relationship query:
+     * Trigger.new does not include related fields, so we must resolve
+     * AccountId -> Account.OwnerId -> User in two steps. This method
+     * handles both steps in bulk.
+     *
+     * @param opps  Opportunities whose Account owners we need
+     * @return      Map of Account OwnerId -> User record
      */
-    private void createStageChangeHistoryTasks(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        List<Task> historyTasks = new List<Task>();
-
-        for (Opportunity opp : newOpps) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
-
-            if (opp.StageName != oldOpp.StageName) {
-                historyTasks.add(new Task(
-                    Subject     = 'Stage Change: ' + oldOpp.StageName + ' → ' + opp.StageName,
-                    WhatId      = opp.Id,
-                    OwnerId     = opp.OwnerId,
-                    Status      = 'Completed',
-                    Priority    = 'Low',
-                    ActivityDate = Date.today(),
-                    Description = 'Automated stage-change log by Skieward trigger framework.'
-                ));
+    private Map<Id, User> fetchAccountOwners(List<Opportunity> opps) {
+        // Step 1: Collect all AccountIds from the Opportunity list
+        Set<Id> accountIds = new Set<Id>();
+        for (Opportunity opp : opps) {
+            if (opp.AccountId != null) {
+                accountIds.add(opp.AccountId);
             }
         }
 
-        if (!historyTasks.isEmpty()) {
-            insert historyTasks;
+        if (accountIds.isEmpty()) {
+            return new Map<Id, User>();
         }
-    }
 
-    // ---------------------------------------------------------------------------
-    // Utility
-    // ---------------------------------------------------------------------------
+        // Step 2: Query Accounts to get their OwnerId values
+        Map<Id, Id> accountToOwnerIdMap = new Map<Id, Id>();
+        for (Account acc : [
+            SELECT Id, OwnerId
+            FROM Account
+            WHERE Id IN :accountIds
+        ]) {
+            accountToOwnerIdMap.put(acc.Id, acc.OwnerId);
+        }
 
-    /**
-     * @description Simplified admin bypass check. In production this would use
-     *              Custom Permissions or a Custom Metadata Type.
-     * @return Boolean true if the running user should bypass stage validation.
-     */
-    @TestVisible
-    private Boolean isAdminBypass() {
-        return FeatureManagement.checkPermission('Bypass_Opportunity_Stage_Validation');
+        // Step 3: Collect distinct Account owner User IDs
+        Set<Id> ownerIds = new Set<Id>(accountToOwnerIdMap.values());
+
+        if (ownerIds.isEmpty()) {
+            return new Map<Id, User>();
+        }
+
+        // Step 4: Query User records for active status — keyed by User Id
+        Map<Id, User> userMap = new Map<Id, User>([
+            SELECT Id, IsActive, Name
+            FROM User
+            WHERE Id IN :ownerIds
+        ]);
+
+        // Step 5: Return a map keyed by AccountId -> User (the Account's owner)
+        // This allows OpportunityTaskService to look up the owner by AccountId
+        // without needing to repeat the Account query.
+        Map<Id, User> accountOwnerMap = new Map<Id, User>();
+        for (Id accountId : accountToOwnerIdMap.keySet()) {
+            Id ownerId = accountToOwnerIdMap.get(accountId);
+            if (userMap.containsKey(ownerId)) {
+                accountOwnerMap.put(accountId, userMap.get(ownerId));
+            }
+        }
+
+        return accountOwnerMap;
     }
 }
