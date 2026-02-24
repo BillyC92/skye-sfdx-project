@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomNotificationType xmlns="http://soap.sforce.com/2006/04/metadata">
+    <customNotifTypeName>Follow Up Notification</customNotifTypeName>
+    <description>Notifies Sales Manager users when a high-value Opportunity (Amount greater than $50,000) is created. Sent via OpportunityNotificationService.</description>
+    <desktop>true</desktop>
+    <masterLabel>Follow Up Notification</masterLabel>
+    <mobile>true</mobile>
+</CustomNotificationType>

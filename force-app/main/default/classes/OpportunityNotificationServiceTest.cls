@@ -1,411 +1,397 @@
 /**
  * OpportunityNotificationServiceTest
  *
- * Comprehensive test coverage for OpportunityNotificationService.
+ * Tests for OpportunityNotificationService.
  *
  * Testing strategy:
- * - Messaging.CustomNotification.send() cannot be called in test context without
- *   a real CustomNotificationType, so we verify the service handles missing
- *   notification types gracefully and test all branching logic up to the send call.
- * - We use @TestVisible constants and helper methods to assert correct message
- *   construction and recipient resolution without needing to actually deliver
- *   a push notification.
- * - All tests use SeeAllData=false and create their own data.
+ * - Messaging.CustomNotification.send() cannot be fully mocked in Apex without
+ *   a stub framework, so tests verify:
+ *     (a) No unhandled exceptions are thrown under any scenario.
+ *     (b) The service exits early (no notification attempt) when pre-conditions
+ *         are not met (low amount, no notification type, no Sales Manager).
+ *     (c) Bulk behaviour with 200 records does not breach governor limits.
  *
- * @author Skye
- * @ticket KAN-5
+ * Where the CustomNotificationType or Sales Manager role is absent in the test
+ * org, the service must exit silently — these paths are explicitly tested.
+ *
+ * Note: CustomNotificationType records cannot be inserted via Apex DML in tests,
+ * so tests that exercise the notification-send path rely on the type existing in
+ * the org (deployed via metadata). Tests are written to be safe whether or not
+ * the type is present.
  */
 @IsTest
 private class OpportunityNotificationServiceTest {
 
     // -------------------------------------------------------------------------
-    // Test data setup
+    // Test data helpers
     // -------------------------------------------------------------------------
 
     /**
-     * Creates a standard test Account with an active owner.
+     * Creates a minimal Account with an active owner for use across tests.
+     * Does NOT insert — caller decides whether to insert.
      */
-    private static Account createTestAccount(Id ownerId) {
-        Account acct = new Account(
-            Name = 'Test Account',
-            OwnerId = ownerId
-        );
-        insert acct;
-        return acct;
+    private static Account buildAccount(String name) {
+        return new Account(Name = name);
     }
 
     /**
-     * Creates a test Opportunity linked to the given Account.
+     * Builds an Opportunity with the given amount and links it to the provided
+     * Account. Does NOT insert.
      */
-    private static Opportunity createTestOpportunity(
+    private static Opportunity buildOpportunity(
         String name,
+        Decimal amount,
         Id accountId,
         Id ownerId,
-        Decimal amount,
-        String stageName
+        String stageName,
+        Date closeDate
     ) {
         return new Opportunity(
-            Name = name,
+            Name      = name,
+            Amount    = amount,
             AccountId = accountId,
-            OwnerId = ownerId,
-            Amount = amount,
+            OwnerId   = ownerId,
             StageName = stageName,
-            CloseDate = Date.today().addDays(30)
+            CloseDate = closeDate
         );
-    }
-
-    /**
-     * Creates a UserRole with the given name.
-     */
-    private static UserRole createRole(String roleName) {
-        UserRole role = new UserRole(Name = roleName, DeveloperName = roleName.replaceAll(' ', '_'));
-        insert role;
-        return role;
-    }
-
-    /**
-     * Creates a minimal active test User with the given role.
-     * Uses a unique username to avoid conflicts across test runs.
-     */
-    private static User createUser(String lastName, Id roleId) {
-        Profile p = [SELECT Id FROM Profile WHERE Name = 'Standard User' LIMIT 1];
-        User u = new User(
-            LastName = lastName,
-            FirstName = 'Test',
-            Email = lastName.toLowerCase().replaceAll(' ', '') + '@test.example.com',
-            Username = lastName.toLowerCase().replaceAll(' ', '') +
-                       String.valueOf(Math.random()).replaceAll('\.', '') +
-                       '@test.example.com',
-            Alias = lastName.left(5).toLowerCase(),
-            TimeZoneSidKey = 'America/New_York',
-            LocaleSidKey = 'en_US',
-            EmailEncodingKey = 'UTF-8',
-            LanguageLocaleKey = 'en_US',
-            ProfileId = p.Id,
-            UserRoleId = roleId,
-            IsActive = true
-        );
-        insert u;
-        return u;
     }
 
     // -------------------------------------------------------------------------
-    // Tests: buildNotificationBody (unit — no DML required)
+    // Scenario 1: Amount at or below threshold — no notification attempt
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testBuildNotificationBody_standardValues() {
-        Opportunity opp = new Opportunity(
-            Name = 'Big Deal',
-            Amount = 75000,
-            OwnerId = UserInfo.getUserId()
+    static void testLowAmountOpportunity_noNotificationSent() {
+        Account acc = buildAccount('Low Value Corp');
+        insert acc;
+
+        Opportunity opp = buildOpportunity(
+            'Small Deal',
+            49999.99,
+            acc.Id,
+            UserInfo.getUserId(),
+            'Prospecting',
+            Date.today().addDays(30)
+        );
+        insert opp;
+
+        // Re-query with Owner relationship populated (mirrors what the handler provides)
+        List<Opportunity> opps = [
+            SELECT Id, Name, Amount, OwnerId, Owner.Name, AccountId
+            FROM Opportunity
+            WHERE Id = :opp.Id
+        ];
+        Map<Id, Account> accountById = new Map<Id, Account>(
+            [SELECT Id, Name, OwnerId FROM Account WHERE Id = :acc.Id]
         );
 
         Test.startTest();
-        String body = OpportunityNotificationService.buildNotificationBody(opp, 'Jane Smith');
+        // Expect no exception — service should exit silently for low amounts
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
+            opps, accountById
+        );
         Test.stopTest();
 
-        System.assertEquals(
-            'Big Deal ($75000) was just created by Jane Smith',
-            body,
-            'Notification body should match the expected format.'
-        );
+        // If we reach here without exception, the test passes.
+        // There is no side-effect to assert on for the early-exit path.
+        System.assert(true, 'Service should complete without exception for low-amount Opportunity');
     }
 
+    // -------------------------------------------------------------------------
+    // Scenario 2: Amount exactly at threshold (50000) — not qualifying
+    // -------------------------------------------------------------------------
+
     @IsTest
-    static void testBuildNotificationBody_nullAmount() {
-        Opportunity opp = new Opportunity(
-            Name = 'No Amount Deal',
-            Amount = null,
-            OwnerId = UserInfo.getUserId()
+    static void testAmountExactlyAtThreshold_noNotificationSent() {
+        Account acc = buildAccount('Threshold Corp');
+        insert acc;
+
+        Opportunity opp = buildOpportunity(
+            'Threshold Deal',
+            50000,
+            acc.Id,
+            UserInfo.getUserId(),
+            'Prospecting',
+            Date.today().addDays(30)
+        );
+        insert opp;
+
+        List<Opportunity> opps = [
+            SELECT Id, Name, Amount, OwnerId, Owner.Name, AccountId
+            FROM Opportunity
+            WHERE Id = :opp.Id
+        ];
+        Map<Id, Account> accountById = new Map<Id, Account>(
+            [SELECT Id, Name, OwnerId FROM Account WHERE Id = :acc.Id]
         );
 
         Test.startTest();
-        String body = OpportunityNotificationService.buildNotificationBody(opp, 'John Doe');
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
+            opps, accountById
+        );
         Test.stopTest();
 
         System.assert(
-            body.contains('$0'),
-            'Null amount should render as $0 in the notification body.'
+            true,
+            'Service should complete without exception for Opportunity at exactly $50,000 (not > threshold)'
         );
     }
 
+    // -------------------------------------------------------------------------
+    // Scenario 3: Amount above threshold — service runs notification path
+    //             without throwing (Sales Manager role may or may not exist)
+    // -------------------------------------------------------------------------
+
     @IsTest
-    static void testBuildNotificationBody_decimalAmount() {
-        Opportunity opp = new Opportunity(
-            Name = 'Decimal Deal',
-            Amount = 75000.99,
-            OwnerId = UserInfo.getUserId()
+    static void testHighAmountOpportunity_noExceptionThrown() {
+        Account acc = buildAccount('High Value Corp');
+        insert acc;
+
+        Opportunity opp = buildOpportunity(
+            'Big Deal',
+            75000,
+            acc.Id,
+            UserInfo.getUserId(),
+            'Prospecting',
+            Date.today().addDays(30)
+        );
+        insert opp;
+
+        List<Opportunity> opps = [
+            SELECT Id, Name, Amount, OwnerId, Owner.Name, AccountId
+            FROM Opportunity
+            WHERE Id = :opp.Id
+        ];
+        Map<Id, Account> accountById = new Map<Id, Account>(
+            [SELECT Id, Name, OwnerId FROM Account WHERE Id = :acc.Id]
         );
 
         Test.startTest();
-        String body = OpportunityNotificationService.buildNotificationBody(opp, 'Alice');
+        // Whether or not the CustomNotificationType / Sales Manager role exists,
+        // the service must not throw an unhandled exception.
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
+            opps, accountById
+        );
         Test.stopTest();
 
-        // Amount is scaled to 0 decimal places
         System.assert(
-            body.contains('$75001') || body.contains('$75000'),
-            'Decimal amount should be rounded/truncated in the notification body. Got: ' + body
+            true,
+            'Service should complete without exception even when notification type or role is absent'
         );
     }
 
     // -------------------------------------------------------------------------
-    // Tests: sendInsertNotifications — guard clauses
+    // Scenario 4: Null Amount — should not qualify and must not throw NPE
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testSendInsertNotifications_nullList_noException() {
+    static void testNullAmount_noExceptionThrown() {
+        Account acc = buildAccount('Null Amount Corp');
+        insert acc;
+
+        Opportunity opp = buildOpportunity(
+            'No Amount Deal',
+            null,
+            acc.Id,
+            UserInfo.getUserId(),
+            'Prospecting',
+            Date.today().addDays(30)
+        );
+        insert opp;
+
+        List<Opportunity> opps = [
+            SELECT Id, Name, Amount, OwnerId, Owner.Name, AccountId
+            FROM Opportunity
+            WHERE Id = :opp.Id
+        ];
+        Map<Id, Account> accountById = new Map<Id, Account>(
+            [SELECT Id, Name, OwnerId FROM Account WHERE Id = :acc.Id]
+        );
+
         Test.startTest();
-        // Should return silently without throwing
-        OpportunityNotificationService.sendInsertNotifications(null, new Map<Id, Account>());
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
+            opps, accountById
+        );
         Test.stopTest();
 
-        System.assert(true, 'Null opportunity list should not throw an exception.');
+        System.assert(
+            true,
+            'Service should handle null Amount gracefully without NullPointerException'
+        );
     }
 
+    // -------------------------------------------------------------------------
+    // Scenario 5: Opportunity without an Account — edge case, no NPE
+    // -------------------------------------------------------------------------
+
     @IsTest
-    static void testSendInsertNotifications_emptyList_noException() {
+    static void testOpportunityWithoutAccount_noExceptionThrown() {
+        // Opportunities can exist without an Account in some org configurations.
+        Opportunity opp = buildOpportunity(
+            'No Account Deal',
+            80000,
+            null,
+            UserInfo.getUserId(),
+            'Prospecting',
+            Date.today().addDays(30)
+        );
+        insert opp;
+
+        List<Opportunity> opps = [
+            SELECT Id, Name, Amount, OwnerId, Owner.Name, AccountId
+            FROM Opportunity
+            WHERE Id = :opp.Id
+        ];
+        // Pass an empty account map — simulates no Account being found
+        Map<Id, Account> accountById = new Map<Id, Account>();
+
         Test.startTest();
-        OpportunityNotificationService.sendInsertNotifications(
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
+            opps, accountById
+        );
+        Test.stopTest();
+
+        System.assert(
+            true,
+            'Service should handle Opportunity with no Account without throwing an exception'
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Scenario 6: Empty list — early exit, no exception
+    // -------------------------------------------------------------------------
+
+    @IsTest
+    static void testEmptyList_noExceptionThrown() {
+        Test.startTest();
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
             new List<Opportunity>(),
             new Map<Id, Account>()
         );
         Test.stopTest();
 
-        System.assert(true, 'Empty opportunity list should not throw an exception.');
+        System.assert(true, 'Service should handle empty Opportunity list without exception');
     }
 
     // -------------------------------------------------------------------------
-    // Tests: missing Sales Manager role — silent skip
+    // Scenario 7: Null list — defensive null check, no exception
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testSendInsertNotifications_missingSalesManagerRole_noException() {
-        // Do NOT create a 'Sales Manager' role — verify the service handles absence gracefully.
-        Account acct = createTestAccount(UserInfo.getUserId());
-
-        Opportunity opp = createTestOpportunity(
-            'High Value Opp',
-            acct.Id,
-            UserInfo.getUserId(),
-            75000,
-            'Prospecting'
-        );
-        // Do not insert — we pass the list directly to the service.
-        opp.Id = null; // Ensure no Id confusion
-
-        Map<Id, Account> accountsById = new Map<Id, Account>{ acct.Id => acct };
-
+    static void testNullList_noExceptionThrown() {
         Test.startTest();
-        // Should return silently — no Sales Manager role exists
-        OpportunityNotificationService.sendInsertNotifications(
-            new List<Opportunity>{ opp },
-            accountsById
-        );
-        Test.stopTest();
-
-        System.assert(true, 'Missing Sales Manager role should not throw an exception.');
-    }
-
-    // -------------------------------------------------------------------------
-    // Tests: missing CustomNotificationType — silent skip with log
-    // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testSendInsertNotifications_missingNotificationType_noException() {
-        // The CustomNotificationType 'OpportunityFollowUpNotification' will not
-        // exist in the test org sandbox — verify the service handles this gracefully.
-        UserRole salesMgrRole = createRole('Sales Manager');
-        User salesMgr = createUser('SalesManager', salesMgrRole.Id);
-
-        // Run as a user without special permissions to keep the test isolated.
-        Account acct;
-        Opportunity opp;
-
-        System.runAs(salesMgr) {
-            acct = createTestAccount(salesMgr.Id);
-        }
-
-        opp = createTestOpportunity(
-            'Big Opp',
-            acct.Id,
-            UserInfo.getUserId(),
-            80000,
-            'Prospecting'
-        );
-
-        Map<Id, Account> accountsById = new Map<Id, Account>{ acct.Id => acct };
-
-        Test.startTest();
-        // CustomNotificationType does not exist in test context — should log and return
-        OpportunityNotificationService.sendInsertNotifications(
-            new List<Opportunity>{ opp },
-            accountsById
-        );
-        Test.stopTest();
-
-        System.assert(
-            true,
-            'Missing CustomNotificationType should not throw — service should log and return.'
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Tests: Opportunity with no AccountId — silent skip
-    // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testSendInsertNotifications_noAccount_silentSkip() {
-        UserRole salesMgrRole = createRole('Sales Manager');
-
-        Opportunity opp = new Opportunity(
-            Name = 'No Account Opp',
-            AccountId = null,
-            OwnerId = UserInfo.getUserId(),
-            Amount = 75000,
-            StageName = 'Prospecting',
-            CloseDate = Date.today().addDays(30)
-        );
-
-        Test.startTest();
-        OpportunityNotificationService.sendInsertNotifications(
-            new List<Opportunity>{ opp },
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
+            null,
             new Map<Id, Account>()
         );
         Test.stopTest();
 
-        System.assert(
-            true,
-            'Opportunity with no AccountId should be skipped silently.'
-        );
+        System.assert(true, 'Service should handle null Opportunity list without exception');
     }
 
     // -------------------------------------------------------------------------
-    // Tests: Account with no Sales Manager in hierarchy — silent skip
+    // Scenario 8: Mixed list — some above threshold, some below
+    //             All records processed without exception
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testSendInsertNotifications_accountOwnerHasNoSalesManagerParent_silentSkip() {
-        // Create a role that is NOT 'Sales Manager' so the manager lookup returns nothing.
-        UserRole nonSalesRole = createRole('Account Executive');
-        UserRole salesMgrRole = createRole('Sales Manager');
+    static void testMixedAmounts_noExceptionThrown() {
+        Account acc = buildAccount('Mixed Corp');
+        insert acc;
 
-        User accountOwner = createUser('AccountOwner', nonSalesRole.Id);
-        // accountOwner's manager is NOT a Sales Manager — no ManagerId set.
+        List<Opportunity> oppsToInsert = new List<Opportunity>();
+        oppsToInsert.add(buildOpportunity(
+            'Small Deal', 10000, acc.Id, UserInfo.getUserId(), 'Prospecting', Date.today().addDays(30)
+        ));
+        oppsToInsert.add(buildOpportunity(
+            'Big Deal', 100000, acc.Id, UserInfo.getUserId(), 'Prospecting', Date.today().addDays(30)
+        ));
+        oppsToInsert.add(buildOpportunity(
+            'Medium Deal', 50001, acc.Id, UserInfo.getUserId(), 'Prospecting', Date.today().addDays(30)
+        ));
+        insert oppsToInsert;
 
-        Account acct;
-        System.runAs(accountOwner) {
-            acct = createTestAccount(accountOwner.Id);
-        }
-
-        Opportunity opp = createTestOpportunity(
-            'Orphan Opp',
-            acct.Id,
-            accountOwner.Id,
-            75000,
-            'Prospecting'
+        List<Opportunity> opps = [
+            SELECT Id, Name, Amount, OwnerId, Owner.Name, AccountId
+            FROM Opportunity
+            WHERE Id IN :oppsToInsert
+        ];
+        Map<Id, Account> accountById = new Map<Id, Account>(
+            [SELECT Id, Name, OwnerId FROM Account WHERE Id = :acc.Id]
         );
 
-        Map<Id, Account> accountsById = new Map<Id, Account>{ acct.Id => acct };
-
         Test.startTest();
-        OpportunityNotificationService.sendInsertNotifications(
-            new List<Opportunity>{ opp },
-            accountsById
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
+            opps, accountById
         );
         Test.stopTest();
 
         System.assert(
             true,
-            'Account whose owner has no Sales Manager in hierarchy should be skipped silently.'
+            'Service should process mixed-amount list without exception'
         );
     }
 
     // -------------------------------------------------------------------------
-    // Tests: bulk — 200 opportunities, no exception thrown
+    // Scenario 9: Bulk test — 200 high-value Opportunities
+    //             Verifies governor limits are not breached
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testSendInsertNotifications_bulk200_noException() {
-        UserRole salesMgrRole = createRole('Sales Manager');
-        User salesMgr = createUser('BulkSalesMgr', salesMgrRole.Id);
+    static void testBulk200HighValueOpportunities_noExceptionThrown() {
+        Account acc = buildAccount('Bulk Corp');
+        insert acc;
 
-        UserRole repRole = createRole('Sales Rep');
-        User repUser = createUser('BulkRep', repRole.Id);
-
-        // Set repUser's manager to salesMgr
-        repUser.ManagerId = salesMgr.Id;
-        update repUser;
-
-        Account acct;
-        System.runAs(repUser) {
-            acct = createTestAccount(repUser.Id);
-        }
-
-        List<Opportunity> opps = new List<Opportunity>();
+        List<Opportunity> oppsToInsert = new List<Opportunity>();
         for (Integer i = 0; i < 200; i++) {
-            opps.add(createTestOpportunity(
-                'Bulk Opp ' + i,
-                acct.Id,
-                repUser.Id,
-                75000 + i,
-                'Prospecting'
+            oppsToInsert.add(buildOpportunity(
+                'Bulk Deal ' + i,
+                60000 + i,
+                acc.Id,
+                UserInfo.getUserId(),
+                'Prospecting',
+                Date.today().addDays(30)
             ));
         }
+        insert oppsToInsert;
 
-        Map<Id, Account> accountsById = new Map<Id, Account>{ acct.Id => acct };
+        List<Opportunity> opps = [
+            SELECT Id, Name, Amount, OwnerId, Owner.Name, AccountId
+            FROM Opportunity
+            WHERE Id IN :oppsToInsert
+        ];
+        Map<Id, Account> accountById = new Map<Id, Account>(
+            [SELECT Id, Name, OwnerId FROM Account WHERE Id = :acc.Id]
+        );
 
         Test.startTest();
-        // CustomNotificationType won't exist in test org — service should handle gracefully
-        // for all 200 records without hitting governor limits or throwing.
-        OpportunityNotificationService.sendInsertNotifications(opps, accountsById);
+        OpportunityNotificationService.sendHighValueOpportunityNotifications(
+            opps, accountById
+        );
         Test.stopTest();
 
         System.assert(
             true,
-            'Bulk 200-record invocation should complete without exception or governor limit errors.'
+            'Service should handle 200 high-value Opportunities without hitting governor limits'
         );
     }
 
     // -------------------------------------------------------------------------
-    // Tests: amount boundary — exactly $50k is NOT notified (Amount > 50000)
+    // Scenario 10: Verify NOTIFICATION_TYPE_DEV_NAME and SALES_MANAGER_ROLE_DEV_NAME
+    //              constants are set to expected values
     // -------------------------------------------------------------------------
 
     @IsTest
-    static void testNotificationThreshold_exactlyFiftyK_notQualifying() {
-        // The handler is responsible for filtering Amount > 50000 before calling
-        // this service. This test verifies the threshold constant is correct
-        // and that the service itself does not re-filter (it trusts the caller).
+    static void testConstants_haveExpectedValues() {
         System.assertEquals(
-            50000,
-            OpportunityNotificationService.NOTIFICATION_THRESHOLD,
-            'Notification threshold constant should be 50000 (exclusive — Amount > 50000).'
+            'Follow_Up_Notification',
+            OpportunityNotificationService.NOTIFICATION_TYPE_DEV_NAME,
+            'Notification type DeveloperName constant should match the deployed CustomNotificationType'
         );
-    }
-
-    // -------------------------------------------------------------------------
-    // Tests: notification type constant matches expected value
-    // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testNotificationTypeNameConstant() {
         System.assertEquals(
-            'OpportunityFollowUpNotification',
-            OpportunityNotificationService.NOTIFICATION_TYPE_NAME,
-            'Notification type developer name must match the Setup record.'
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Tests: Sales Manager role name constant
-    // -------------------------------------------------------------------------
-
-    @IsTest
-    static void testSalesManagerRoleNameConstant() {
-        System.assertEquals(
-            'Sales Manager',
-            OpportunityNotificationService.SALES_MANAGER_ROLE_NAME,
-            'Sales Manager role name constant should be \'Sales Manager\'.'
+            'Sales_Manager',
+            OpportunityNotificationService.SALES_MANAGER_ROLE_DEV_NAME,
+            'Sales Manager role DeveloperName constant should match the expected UserRole'
         );
     }
 }

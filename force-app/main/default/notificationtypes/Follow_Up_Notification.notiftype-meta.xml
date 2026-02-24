@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomNotificationType xmlns="http://soap.sforce.com/2006/04/metadata">
+    <allowBrowserNotification>false</allowBrowserNotification>
+    <description>Notification sent to Sales Managers when a new high-value Opportunity (over $50,000) is created. Referenced by DeveloperName in OpportunityNotificationService.</description>
+    <masterLabel>Follow Up Notification</masterLabel>
+    <shouldSendEmail>false</shouldSendEmail>
+</CustomNotificationType>

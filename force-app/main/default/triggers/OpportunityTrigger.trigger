@@ -1,30 +1,43 @@
 /**
  * OpportunityTrigger
  *
- * Single, thin trigger on the Opportunity object.
- * Contains zero business logic — all logic is delegated to OpportunityTriggerHandler.
+ * Single trigger for the Opportunity object. Contains zero logic — all behaviour
+ * is delegated to OpportunityTriggerHandler so that logic remains testable,
+ * maintainable, and easy to extend without touching the trigger itself.
  *
- * Why: Enforcing the one-trigger-per-object pattern ensures a predictable execution
- * order and a single entry point for all Opportunity trigger logic. Adding logic
- * here directly would make it untestable in isolation and harder to maintain.
+ * Contexts registered:
+ *   - before insert  : reserved for future use (e.g. field defaulting)
+ *   - after insert   : Task creation + $50k notification (KAN-5)
+ *   - before update  : reserved for future use (e.g. field validation)
+ *   - after update   : Task creation on Closed Won transition (KAN-5)
  *
- * Fires on:
- *   - before insert  : reserved for future before-save field defaulting
- *   - after insert   : new Opportunity creation logic (e.g. $50k notifications)
- *   - after update   : stage transition logic (e.g. Closed Won task creation)
+ * DO NOT add logic directly to this file. Add a new method to
+ * OpportunityTriggerHandler and call it from the appropriate context block.
  */
-trigger OpportunityTrigger on Opportunity (before insert, after insert, after update) {
-    OpportunityTriggerHandler handler = new OpportunityTriggerHandler();
+trigger OpportunityTrigger on Opportunity (
+    before insert,
+    after insert,
+    before update,
+    after update
+) {
+    OpportunityTriggerHandler handler = new OpportunityTriggerHandler(
+        Trigger.new,
+        Trigger.newMap,
+        Trigger.old,
+        Trigger.oldMap
+    );
 
     if (Trigger.isBefore) {
         if (Trigger.isInsert) {
-            handler.onBeforeInsert(Trigger.new);
+            handler.onBeforeInsert();
+        } else if (Trigger.isUpdate) {
+            handler.onBeforeUpdate();
         }
     } else if (Trigger.isAfter) {
         if (Trigger.isInsert) {
-            handler.onAfterInsert(Trigger.new);
+            handler.onAfterInsert();
         } else if (Trigger.isUpdate) {
-            handler.onAfterUpdate(Trigger.new, Trigger.oldMap);
+            handler.onAfterUpdate();
         }
     }
 }

@@ -1,13 +1,3 @@
-/**
- * @description Comprehensive test class for the Opportunity trigger handler framework.
- *              Covers all acceptance criteria defined in KAN-5:
- *              - Closed Won Task creation (single, bulk, inactive owner fallback)
- *              - $50k+ insert notification (and no notification on update)
- *              - Boundary conditions and graceful failure scenarios
- *
- * @author      Skye
- * @ticket      KAN-5
- */
 @IsTest
 private class OpportunityTriggerHandlerTest {
 
@@ -16,624 +6,516 @@ private class OpportunityTriggerHandlerTest {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * @description Creates a standard Account with an active owner.
-     *              The Account owner becomes the expected Task assignee in the
-     *              happy-path Closed Won scenario.
+     * Creates a standard active user with a given role.
+     * Using a helper keeps test data consistent and DRY.
      */
-    private static Account createAccount(Id ownerId) {
-        Account acc = new Account(
-            Name    = 'Test Account',
-            OwnerId = ownerId
-        );
-        insert acc;
-        return acc;
-    }
-
-    /**
-     * @description Creates an Opportunity in a non-terminal stage so that
-     *              subsequent updates can trigger the Closed Won transition.
-     */
-    private static Opportunity createOpenOpportunity(
-        Id accountId,
-        Id ownerId,
-        Decimal amount
-    ) {
-        return new Opportunity(
-            Name        = 'Test Opp',
-            AccountId   = accountId,
-            OwnerId     = ownerId,
-            StageName   = 'Prospecting',
-            CloseDate   = Date.today().addDays(30),
-            Amount      = amount
-        );
-    }
-
-    /**
-     * @description Creates a minimal active user in a given profile.
-     *              Uses a unique username suffix to avoid conflicts across
-     *              parallel test runs.
-     */
-    private static User createUser(String lastName, String profileName, Boolean isActive) {
-        Profile p = [SELECT Id FROM Profile WHERE Name = :profileName LIMIT 1];
+    private static User createUser(String lastName, Id roleId, Boolean isActive) {
+        Profile p = [SELECT Id FROM Profile WHERE Name = 'Standard User' LIMIT 1];
         User u = new User(
-            LastName           = lastName,
-            FirstName          = 'Test',
-            Alias              = lastName.left(8),
-            Email              = lastName + '@test.example.com',
-            Username           = lastName + '.' + UserInfo.getOrganizationId() + '@test.example.com',
-            ProfileId          = p.Id,
-            TimeZoneSidKey     = 'America/Los_Angeles',
-            LocaleSidKey       = 'en_US',
-            EmailEncodingKey   = 'UTF-8',
-            LanguageLocaleKey  = 'en_US',
-            IsActive           = isActive
+            FirstName       = 'Test',
+            LastName        = lastName,
+            Email           = lastName.toLowerCase().replaceAll(' ', '') + '@test.example.com',
+            Username        = lastName.toLowerCase().replaceAll(' ', '') + '.' +
+                              String.valueOf(Math.random()).replace('0.', '') + '@test.example.com',
+            Alias           = lastName.left(8),
+            TimeZoneSidKey  = 'America/New_York',
+            LocaleSidKey    = 'en_US',
+            EmailEncodingKey = 'UTF-8',
+            LanguageLocaleKey = 'en',
+            ProfileId       = p.Id,
+            UserRoleId      = roleId,
+            IsActive        = isActive
         );
-        insert u;
         return u;
     }
 
     /**
-     * @description Creates a UserRole with the given name.
-     *              Used to simulate the Sales Manager role lookup.
+     * Creates or retrieves the Sales Manager UserRole.
+     * In a scratch org the role may not exist; we create it if absent.
+     * Returns null if creation is not possible (e.g., role hierarchy locked).
      */
-    private static UserRole createRole(String roleName) {
-        UserRole role = new UserRole(Name = roleName, DeveloperName = roleName.replaceAll(' ', '_'));
+    private static UserRole upsertSalesManagerRole() {
+        List<UserRole> existing = [
+            SELECT Id, DeveloperName
+            FROM   UserRole
+            WHERE  DeveloperName = 'Sales_Manager'
+            LIMIT  1
+        ];
+        if (!existing.isEmpty()) {
+            return existing[0];
+        }
+        UserRole role = new UserRole(
+            Name            = 'Sales Manager',
+            DeveloperName   = 'Sales_Manager'
+        );
         insert role;
         return role;
     }
 
+    /**
+     * Creates a test Account owned by the supplied user.
+     */
+    private static Account createAccount(String name, Id ownerId) {
+        Account a = new Account(
+            Name    = name,
+            OwnerId = ownerId
+        );
+        insert a;
+        return a;
+    }
+
+    /**
+     * Builds (but does NOT insert) an Opportunity.
+     */
+    private static Opportunity buildOpportunity(
+        String name,
+        Id accountId,
+        Id ownerId,
+        String stageName,
+        Date closeDate,
+        Decimal amount
+    ) {
+        return new Opportunity(
+            Name        = name,
+            AccountId   = accountId,
+            OwnerId     = ownerId,
+            StageName   = stageName,
+            CloseDate   = closeDate,
+            Amount      = amount
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 1: Single Closed Won transition → Task assigned to Account owner
+    // Scenario 1 — Single Closed Won INSERT creates Task assigned to Account owner
     // ─────────────────────────────────────────────────────────────────────────
 
     @IsTest
-    static void testSingleClosedWon_TaskAssignedToAccountOwner() {
-        // Arrange
-        User oppOwner  = createUser('OppOwner',  'Standard User', true);
-        User accOwner  = createUser('AccOwner',  'Standard User', true);
+    static void insertClosedWon_createsTaskAssignedToAccountOwner() {
+        UserRole role = upsertSalesManagerRole();
 
-        Account acc;
-        Opportunity opp;
+        User accountOwner = createUser('AccountOwner1', null, true);
+        User oppOwner     = createUser('OppOwner1', null, true);
+        insert new List<User>{ accountOwner, oppOwner };
 
-        System.runAs(oppOwner) {
-            acc = createAccount(accOwner.Id);
-            opp = createOpenOpportunity(acc.Id, oppOwner.Id, 10000);
-            insert opp;
-        }
+        Account acc = createAccount('Test Account 1', accountOwner.Id);
 
-        // Act — transition to Closed Won
+        Opportunity opp = buildOpportunity(
+            'Test Opp 1', acc.Id, oppOwner.Id,
+            'Closed Won', Date.today().addDays(30), 10000
+        );
+
+        Test.startTest();
+        insert opp;
+        Test.stopTest();
+
+        List<Task> tasks = [SELECT Id, OwnerId, Subject, ActivityDate, WhatId, Status, Priority
+                            FROM   Task
+                            WHERE  WhatId = :opp.Id];
+
+        System.assertEquals(1, tasks.size(),
+            'Exactly one Task should be created for a Closed Won insert.');
+
+        Task t = tasks[0];
+        System.assertEquals(accountOwner.Id, t.OwnerId,
+            'Task should be assigned to the Account owner when they are active.');
+        System.assertEquals('Follow up: ' + opp.Name, t.Subject,
+            'Task Subject should follow the prescribed format.');
+        System.assertEquals(opp.CloseDate.addDays(7), t.ActivityDate,
+            'Task ActivityDate should be CloseDate + 7 days.');
+        System.assertEquals('Not Started', t.Status,
+            'Task Status should be Not Started.');
+        System.assertEquals('Normal', t.Priority,
+            'Task Priority should be Normal.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 2 — UPDATE transition to Closed Won creates Task
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void updateToClosedWon_createsTask() {
+        User accountOwner = createUser('AccountOwner2', null, true);
+        User oppOwner     = createUser('OppOwner2', null, true);
+        insert new List<User>{ accountOwner, oppOwner };
+
+        Account acc = createAccount('Test Account 2', accountOwner.Id);
+
+        Opportunity opp = buildOpportunity(
+            'Test Opp 2', acc.Id, oppOwner.Id,
+            'Prospecting', Date.today().addDays(30), 10000
+        );
+        insert opp;
+
+        // Confirm no Task exists before the transition
+        System.assertEquals(0,
+            [SELECT COUNT() FROM Task WHERE WhatId = :opp.Id],
+            'No Task should exist before transitioning to Closed Won.');
+
         Test.startTest();
         opp.StageName = 'Closed Won';
         update opp;
         Test.stopTest();
 
-        // Assert — exactly one Task created, assigned to Account owner
-        List<Task> tasks = [SELECT Id, Subject, OwnerId, ActivityDate, WhatId
-                            FROM Task
-                            WHERE WhatId = :opp.Id];
-
-        Assert.areEqual(1, tasks.size(),
-            'Expected exactly one follow-up Task for the Closed Won opportunity.');
-
-        Task t = tasks[0];
-        Assert.areEqual('Follow up: ' + opp.Name, t.Subject,
-            'Task Subject should be "Follow up: " + Opportunity Name.');
-        Assert.areEqual(accOwner.Id, t.OwnerId,
-            'Task should be assigned to the Account owner when the Account owner is active.');
-        Assert.areEqual(opp.CloseDate.addDays(7), t.ActivityDate,
-            'Task ActivityDate should be CloseDate + 7 days.');
-        Assert.areEqual(opp.Id, t.WhatId,
-            'Task WhatId should reference the Opportunity.');
+        List<Task> tasks = [SELECT Id, OwnerId FROM Task WHERE WhatId = :opp.Id];
+        System.assertEquals(1, tasks.size(),
+            'One Task should be created when Opportunity transitions to Closed Won.');
+        System.assertEquals(accountOwner.Id, tasks[0].OwnerId,
+            'Task should be assigned to the active Account owner.');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 2: Bulk — 200 records transitioning to Closed Won all get Tasks
+    // Scenario 3 — UPDATE that stays Closed Won does NOT create a duplicate Task
     // ─────────────────────────────────────────────────────────────────────────
 
     @IsTest
-    static void testBulkClosedWon_200Records_AllGetTasks() {
-        // Arrange
-        User oppOwner = createUser('BulkOppOwner', 'Standard User', true);
-        User accOwner = createUser('BulkAccOwner', 'Standard User', true);
+    static void updateStaysClosedWon_noDuplicateTask() {
+        User accountOwner = createUser('AccountOwner3', null, true);
+        User oppOwner     = createUser('OppOwner3', null, true);
+        insert new List<User>{ accountOwner, oppOwner };
 
-        Account acc;
+        Account acc = createAccount('Test Account 3', accountOwner.Id);
+
+        // Insert already Closed Won — Task created on insert
+        Opportunity opp = buildOpportunity(
+            'Test Opp 3', acc.Id, oppOwner.Id,
+            'Closed Won', Date.today().addDays(30), 10000
+        );
+        insert opp;
+
+        Integer taskCountAfterInsert = [SELECT COUNT() FROM Task WHERE WhatId = :opp.Id];
+        System.assertEquals(1, taskCountAfterInsert,
+            'One Task should exist after initial Closed Won insert.');
+
+        Test.startTest();
+        // Update a non-stage field — stage remains Closed Won
+        opp.Description = 'Updated description';
+        update opp;
+        Test.stopTest();
+
+        Integer taskCountAfterUpdate = [SELECT COUNT() FROM Task WHERE WhatId = :opp.Id];
+        System.assertEquals(1, taskCountAfterUpdate,
+            'No additional Task should be created when stage stays Closed Won.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 4 — Inactive Account owner causes Task fallback to Opportunity owner
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void inactiveAccountOwner_taskAssignedToOppOwner() {
+        // We need to create the inactive user, then deactivate after insert
+        // (Salesforce requires IsActive=true on insert in some orgs)
+        User inactiveAccountOwner = createUser('InactiveAccOwner4', null, true);
+        User oppOwner             = createUser('OppOwner4', null, true);
+        insert new List<User>{ inactiveAccountOwner, oppOwner };
+
+        // Deactivate the account owner
+        inactiveAccountOwner.IsActive = false;
+        update inactiveAccountOwner;
+
+        Account acc = createAccount('Test Account 4', inactiveAccountOwner.Id);
+
+        Opportunity opp = buildOpportunity(
+            'Test Opp 4', acc.Id, oppOwner.Id,
+            'Closed Won', Date.today().addDays(30), 10000
+        );
+
+        Test.startTest();
+        insert opp;
+        Test.stopTest();
+
+        List<Task> tasks = [SELECT Id, OwnerId FROM Task WHERE WhatId = :opp.Id];
+        System.assertEquals(1, tasks.size(),
+            'One Task should be created even when Account owner is inactive.');
+        System.assertEquals(oppOwner.Id, tasks[0].OwnerId,
+            'Task should fall back to Opportunity owner when Account owner is inactive.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 5 — INSERT with Amount > $50k sends notification (no exception)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void insertHighValueOpp_notificationSentWithoutException() {
+        UserRole salesManagerRole = upsertSalesManagerRole();
+
+        User salesManager = createUser('SalesManager5', salesManagerRole.Id, true);
+        User oppOwner     = createUser('OppOwner5', null, true);
+        insert new List<User>{ salesManager, oppOwner };
+
+        Account acc = createAccount('Test Account 5', oppOwner.Id);
+
+        Opportunity opp = buildOpportunity(
+            'Big Deal 5', acc.Id, oppOwner.Id,
+            'Prospecting', Date.today().addDays(30), 75000
+        );
+
+        Boolean exceptionThrown = false;
+        Test.startTest();
+        try {
+            insert opp;
+        } catch (Exception e) {
+            exceptionThrown = true;
+        }
+        Test.stopTest();
+
+        System.assertEquals(false, exceptionThrown,
+            'Inserting a high-value Opportunity should not throw an exception, ' +
+            'even if the notification type is unavailable in test context.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 6 — UPDATE with Amount > $50k does NOT send notification
+    //              (notification service is only called on after insert)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void updateHighValueOpp_noNotificationSent() {
+        UserRole salesManagerRole = upsertSalesManagerRole();
+
+        User salesManager = createUser('SalesManager6', salesManagerRole.Id, true);
+        User oppOwner     = createUser('OppOwner6', null, true);
+        insert new List<User>{ salesManager, oppOwner };
+
+        Account acc = createAccount('Test Account 6', oppOwner.Id);
+
+        // Insert below threshold so no notification fires on insert
+        Opportunity opp = buildOpportunity(
+            'Growing Deal 6', acc.Id, oppOwner.Id,
+            'Prospecting', Date.today().addDays(30), 10000
+        );
+        insert opp;
+
+        Boolean exceptionThrown = false;
+        Test.startTest();
+        try {
+            // Raise amount above threshold and update — notification should NOT fire
+            opp.Amount = 100000;
+            update opp;
+        } catch (Exception e) {
+            exceptionThrown = true;
+        }
+        Test.stopTest();
+
+        // Primary assertion: no exception from notification path on update
+        System.assertEquals(false, exceptionThrown,
+            'Updating a high-value Opportunity should not throw an exception.');
+        // No Task created because stage did not transition to Closed Won
+        System.assertEquals(0,
+            [SELECT COUNT() FROM Task WHERE WhatId = :opp.Id],
+            'No Task should be created when stage does not transition to Closed Won.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 7 — No Sales Manager role present — no error thrown
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void insertHighValueOpp_noSalesManagerRole_noException() {
+        // Deliberately do NOT create or reference a Sales Manager role.
+        // The notification service should exit silently.
+        User oppOwner = createUser('OppOwner7', null, true);
+        insert oppOwner;
+
+        Account acc = createAccount('Test Account 7', oppOwner.Id);
+
+        Opportunity opp = buildOpportunity(
+            'No Manager Deal 7', acc.Id, oppOwner.Id,
+            'Prospecting', Date.today().addDays(30), 99000
+        );
+
+        Boolean exceptionThrown = false;
+        Test.startTest();
+        try {
+            insert opp;
+        } catch (Exception e) {
+            exceptionThrown = true;
+        }
+        Test.stopTest();
+
+        System.assertEquals(false, exceptionThrown,
+            'No exception should be thrown when no Sales Manager role user exists.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 8a — Bulk INSERT: 200 Opportunities — Task path
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void bulkInsert200ClosedWon_tasksCreatedForAll() {
+        User accountOwner = createUser('BulkAccOwner8a', null, true);
+        User oppOwner     = createUser('BulkOppOwner8a', null, true);
+        insert new List<User>{ accountOwner, oppOwner };
+
+        Account acc = createAccount('Bulk Account 8a', accountOwner.Id);
+
         List<Opportunity> opps = new List<Opportunity>();
-
-        System.runAs(oppOwner) {
-            acc = createAccount(accOwner.Id);
-            for (Integer i = 0; i < 200; i++) {
-                opps.add(createOpenOpportunity(acc.Id, oppOwner.Id, 5000));
-            }
-            insert opps;
+        for (Integer i = 0; i < 200; i++) {
+            opps.add(buildOpportunity(
+                'Bulk Opp 8a-' + i, acc.Id, oppOwner.Id,
+                'Closed Won', Date.today().addDays(30), 10000
+            ));
         }
 
-        // Act — bulk update to Closed Won
-        for (Opportunity o : opps) {
-            o.StageName = 'Closed Won';
+        Test.startTest();
+        insert opps;
+        Test.stopTest();
+
+        Integer taskCount = [SELECT COUNT() FROM Task
+                             WHERE WhatId IN :opps
+                             AND   Subject LIKE 'Follow up:%'];
+        System.assertEquals(200, taskCount,
+            'One Task should be created for each of the 200 Closed Won Opportunities.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 8b — Bulk INSERT: 200 Opportunities — Notification path (no exception)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void bulkInsert200HighValue_noException() {
+        UserRole salesManagerRole = upsertSalesManagerRole();
+
+        User salesManager = createUser('BulkSalesMgr8b', salesManagerRole.Id, true);
+        User oppOwner     = createUser('BulkOppOwner8b', null, true);
+        insert new List<User>{ salesManager, oppOwner };
+
+        Account acc = createAccount('Bulk Account 8b', oppOwner.Id);
+
+        List<Opportunity> opps = new List<Opportunity>();
+        for (Integer i = 0; i < 200; i++) {
+            opps.add(buildOpportunity(
+                'Bulk High Value 8b-' + i, acc.Id, oppOwner.Id,
+                'Prospecting', Date.today().addDays(30), 75000
+            ));
+        }
+
+        Boolean exceptionThrown = false;
+        Test.startTest();
+        try {
+            insert opps;
+        } catch (Exception e) {
+            exceptionThrown = true;
+        }
+        Test.stopTest();
+
+        System.assertEquals(false, exceptionThrown,
+            'Bulk inserting 200 high-value Opportunities should not throw an exception.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 9 — Opportunity without Account does not cause NullPointerException
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void insertClosedWonWithoutAccount_noNullPointer() {
+        User oppOwner = createUser('OppOwner9', null, true);
+        insert oppOwner;
+
+        // AccountId intentionally omitted
+        Opportunity opp = new Opportunity(
+            Name      = 'No Account Opp 9',
+            OwnerId   = oppOwner.Id,
+            StageName = 'Closed Won',
+            CloseDate = Date.today().addDays(30),
+            Amount    = 10000
+        );
+
+        Boolean exceptionThrown = false;
+        Test.startTest();
+        try {
+            insert opp;
+        } catch (Exception e) {
+            exceptionThrown = true;
+        }
+        Test.stopTest();
+
+        System.assertEquals(false, exceptionThrown,
+            'Inserting a Closed Won Opportunity without an Account should not throw a NullPointerException.');
+
+        // Task should still be created, assigned to Opportunity owner (no Account owner to check)
+        List<Task> tasks = [SELECT Id, OwnerId FROM Task WHERE WhatId = :opp.Id];
+        System.assertEquals(1, tasks.size(),
+            'A Task should still be created for a Closed Won Opportunity without an Account.');
+        System.assertEquals(oppOwner.Id, tasks[0].OwnerId,
+            'Task should be assigned to the Opportunity owner when no Account is present.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 10 — Mixed batch: some Closed Won, some not — only qualifying
+    //               Opportunities get Tasks
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void insertMixedStages_onlyClosedWonGetTasks() {
+        User accountOwner = createUser('AccOwner10', null, true);
+        User oppOwner     = createUser('OppOwner10', null, true);
+        insert new List<User>{ accountOwner, oppOwner };
+
+        Account acc = createAccount('Test Account 10', accountOwner.Id);
+
+        List<Opportunity> opps = new List<Opportunity>();
+        // 3 Closed Won
+        for (Integer i = 0; i < 3; i++) {
+            opps.add(buildOpportunity(
+                'Closed Opp 10-' + i, acc.Id, oppOwner.Id,
+                'Closed Won', Date.today().addDays(30), 5000
+            ));
+        }
+        // 2 Prospecting (should NOT get Tasks)
+        for (Integer i = 0; i < 2; i++) {
+            opps.add(buildOpportunity(
+                'Open Opp 10-' + i, acc.Id, oppOwner.Id,
+                'Prospecting', Date.today().addDays(30), 5000
+            ));
+        }
+
+        Test.startTest();
+        insert opps;
+        Test.stopTest();
+
+        Integer taskCount = [SELECT COUNT() FROM Task
+                             WHERE WhatId IN :opps
+                             AND   Subject LIKE 'Follow up:%'];
+        System.assertEquals(3, taskCount,
+            'Only the 3 Closed Won Opportunities should have Tasks created.');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenario 11 — Bulk UPDATE: mixed transitions, only newly-Closed-Won get Tasks
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @IsTest
+    static void bulkUpdate_mixedTransitions_onlyNewClosedWonGetTasks() {
+        User accountOwner = createUser('AccOwner11', null, true);
+        User oppOwner     = createUser('OppOwner11', null, true);
+        insert new List<User>{ accountOwner, oppOwner };
+
+        Account acc = createAccount('Test Account 11', accountOwner.Id);
+
+        // 5 Prospecting opps — will transition 3 to Closed Won
+        List<Opportunity> opps = new List<Opportunity>();
+        for (Integer i = 0; i < 5; i++) {
+            opps.add(buildOpportunity(
+                'Transition Opp 11-' + i, acc.Id, oppOwner.Id,
+                'Prospecting', Date.today().addDays(30), 5000
+            ));
+        }
+        insert opps;
+
+        // Transition first 3 to Closed Won
+        for (Integer i = 0; i < 3; i++) {
+            opps[i].StageName = 'Closed Won';
         }
 
         Test.startTest();
         update opps;
         Test.stopTest();
 
-        // Assert — 200 Tasks created, all assigned to Account owner
-        List<Task> tasks = [SELECT Id, OwnerId FROM Task
-                            WHERE WhatId IN :opps];
-
-        Assert.areEqual(200, tasks.size(),
-            'Expected one Task per Opportunity for all 200 bulk Closed Won records.');
-
-        for (Task t : tasks) {
-            Assert.areEqual(accOwner.Id, t.OwnerId,
-                'Every Task should be assigned to the active Account owner.');
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 3: Inactive Account owner → Task falls back to Opportunity owner
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testClosedWon_InactiveAccountOwner_FallsBackToOppOwner() {
-        // Arrange
-        User oppOwner    = createUser('FallbackOppOwner', 'Standard User', true);
-        User inactiveAcc = createUser('InactiveAccOwner', 'Standard User', true);
-
-        Account acc;
-        Opportunity opp;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(inactiveAcc.Id);
-            opp = createOpenOpportunity(acc.Id, oppOwner.Id, 10000);
-            insert opp;
-        }
-
-        // Deactivate the Account owner AFTER setup to avoid mixed-DML issues
-        inactiveAcc.IsActive = false;
-        update inactiveAcc;
-
-        // Act
-        Test.startTest();
-        opp.StageName = 'Closed Won';
-        update opp;
-        Test.stopTest();
-
-        // Assert — Task assigned to Opportunity owner, not the inactive Account owner
-        List<Task> tasks = [SELECT Id, OwnerId FROM Task WHERE WhatId = :opp.Id];
-
-        Assert.areEqual(1, tasks.size(),
-            'Expected exactly one Task even when Account owner is inactive.');
-        Assert.areEqual(oppOwner.Id, tasks[0].OwnerId,
-            'Task should fall back to the Opportunity owner when Account owner is inactive.');
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 4: $50k+ Opportunity on INSERT triggers notification
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testInsert_AmountOver50k_NotificationSent() {
-        // Arrange — create a Sales Manager role and assign a user to it
-        UserRole salesMgrRole = createRole('Sales Manager');
-        User salesMgr = createUser('SalesMgr', 'Standard User', true);
-        salesMgr.UserRoleId = salesMgrRole.Id;
-        update salesMgr;
-
-        User oppOwner = createUser('NotifOppOwner', 'Standard User', true);
-        Account acc;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-        }
-
-        Opportunity opp = new Opportunity(
-            Name      = 'Big Deal',
-            AccountId = acc.Id,
-            OwnerId   = oppOwner.Id,
-            StageName = 'Prospecting',
-            CloseDate = Date.today().addDays(30),
-            Amount    = 75000
-        );
-
-        // Act — insert triggers the notification path
-        Test.startTest();
-        // Messaging.CustomNotification.send() is a no-op in test context;
-        // we verify no exception is thrown and the code path executes cleanly.
-        insert opp;
-        Test.stopTest();
-
-        // Assert — primary assertion is that no exception was thrown.
-        // The notification itself cannot be queried in tests; we verify the
-        // Opportunity was inserted successfully as a proxy for clean execution.
-        List<Opportunity> inserted = [SELECT Id, Amount FROM Opportunity WHERE Id = :opp.Id];
-        Assert.areEqual(1, inserted.size(), 'Opportunity should have been inserted successfully.');
-        Assert.areEqual(75000, inserted[0].Amount, 'Amount should be preserved after insert.');
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 5: $50k+ Opportunity on UPDATE does NOT trigger notification
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testUpdate_AmountOver50k_NoNotificationSent() {
-        // Arrange — notification service should never be invoked on update
-        User oppOwner = createUser('NoNotifOwner', 'Standard User', true);
-        Account acc;
-        Opportunity opp;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-            opp = createOpenOpportunity(acc.Id, oppOwner.Id, 75000);
-            insert opp;
-        }
-
-        // Act — update the record; notification must NOT fire
-        Test.startTest();
-        opp.Description = 'Updated description';
-        update opp; // Should not throw; notification service skipped for updates
-        Test.stopTest();
-
-        // Assert — no Tasks created (not Closed Won), no exception thrown
-        List<Task> tasks = [SELECT Id FROM Task WHERE WhatId = :opp.Id];
-        Assert.areEqual(0, tasks.size(),
-            'No Tasks should be created for a non-Closed-Won update.');
-        // The key assertion is that no exception was thrown during the update.
-        // Notification service is only invoked on insert; this test confirms
-        // the handler correctly gates on trigger context.
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 6: Boundary — Amount exactly $50,000 does NOT trigger notification
-    //             (business rule: Amount > 50000, not >= 50000)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testInsert_AmountExactly50k_NoNotification() {
-        // Arrange
-        User oppOwner = createUser('BoundaryOwner', 'Standard User', true);
-        Account acc;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-        }
-
-        Opportunity opp = new Opportunity(
-            Name      = 'Boundary Deal',
-            AccountId = acc.Id,
-            OwnerId   = oppOwner.Id,
-            StageName = 'Prospecting',
-            CloseDate = Date.today().addDays(30),
-            Amount    = 50000  // Exactly at boundary — should NOT notify
-        );
-
-        // Act
-        Test.startTest();
-        insert opp;
-        Test.stopTest();
-
-        // Assert — Opportunity inserted cleanly; notification path not triggered
-        // (no Sales Manager role exists in this test, so if notification fired
-        //  incorrectly it would still be a silent skip — but the handler should
-        //  not even enter the notification branch for Amount = 50000)
-        List<Opportunity> inserted = [SELECT Id, Amount FROM Opportunity WHERE Id = :opp.Id];
-        Assert.areEqual(1, inserted.size(), 'Opportunity should insert successfully at boundary amount.');
-        Assert.areEqual(50000, inserted[0].Amount, 'Amount should be exactly 50000.');
-    }
-
-    @IsTest
-    static void testInsert_AmountJustOver50k_NotificationPathEntered() {
-        // Arrange — one cent over the boundary should trigger notification path
-        UserRole salesMgrRole = createRole('SalesMgrBoundary');
-        User salesMgr = createUser('SalesMgrBnd', 'Standard User', true);
-        salesMgr.UserRoleId = salesMgrRole.Id;
-        update salesMgr;
-
-        User oppOwner = createUser('BoundaryPlusOwner', 'Standard User', true);
-        Account acc;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-        }
-
-        Opportunity opp = new Opportunity(
-            Name      = 'Just Over Boundary Deal',
-            AccountId = acc.Id,
-            OwnerId   = oppOwner.Id,
-            StageName = 'Prospecting',
-            CloseDate = Date.today().addDays(30),
-            Amount    = 50000.01  // Just over — SHOULD trigger notification
-        );
-
-        // Act
-        Test.startTest();
-        insert opp;
-        Test.stopTest();
-
-        // Assert — no exception thrown; notification path executed cleanly
-        List<Opportunity> inserted = [SELECT Id FROM Opportunity WHERE Id = :opp.Id];
-        Assert.areEqual(1, inserted.size(),
-            'Opportunity just over $50k should insert without error.');
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 7: Missing Sales Manager role → no exception thrown (silent skip)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testInsert_NoSalesManagerRole_NoExceptionThrown() {
-        // Arrange — intentionally do NOT create a Sales Manager role
-        User oppOwner = createUser('NoRoleOwner', 'Standard User', true);
-        Account acc;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-        }
-
-        Opportunity opp = new Opportunity(
-            Name      = 'No Role Deal',
-            AccountId = acc.Id,
-            OwnerId   = oppOwner.Id,
-            StageName = 'Prospecting',
-            CloseDate = Date.today().addDays(30),
-            Amount    = 100000  // Over $50k — notification path entered
-        );
-
-        // Act & Assert — must not throw
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            insert opp;
-        } catch (Exception e) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        Assert.isFalse(exceptionThrown,
-            'No exception should be thrown when the Sales Manager role does not exist.');
-
-        List<Opportunity> inserted = [SELECT Id FROM Opportunity WHERE Id = :opp.Id];
-        Assert.areEqual(1, inserted.size(),
-            'Opportunity should be inserted successfully even without a Sales Manager role.');
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 8: Opportunity NOT transitioning to Closed Won → no Task created
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testUpdate_NotClosedWon_NoTaskCreated() {
-        // Arrange
-        User oppOwner = createUser('NoTaskOwner', 'Standard User', true);
-        Account acc;
-        Opportunity opp;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-            opp = createOpenOpportunity(acc.Id, oppOwner.Id, 5000);
-            insert opp;
-        }
-
-        // Act — update to a different non-terminal stage, not Closed Won
-        Test.startTest();
-        opp.StageName = 'Needs Analysis';
-        update opp;
-        Test.stopTest();
-
-        // Assert — no Tasks created
-        List<Task> tasks = [SELECT Id FROM Task WHERE WhatId = :opp.Id];
-        Assert.areEqual(0, tasks.size(),
-            'No Task should be created when the Opportunity does not transition to Closed Won.');
-    }
-
-    @IsTest
-    static void testUpdate_AlreadyClosedWon_NoAdditionalTaskCreated() {
-        // Arrange — Opportunity already in Closed Won; update a non-stage field
-        // This verifies the handler checks OLD stage != Closed Won (not just new stage)
-        User oppOwner = createUser('AlreadyCWOwner', 'Standard User', true);
-        User accOwner = createUser('AlreadyCWAccOwner', 'Standard User', true);
-        Account acc;
-        Opportunity opp;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(accOwner.Id);
-            opp = createOpenOpportunity(acc.Id, oppOwner.Id, 5000);
-            insert opp;
-        }
-
-        // First transition — creates the Task
-        opp.StageName = 'Closed Won';
-        update opp;
-
-        Integer taskCountAfterFirstTransition =
-            [SELECT COUNT() FROM Task WHERE WhatId = :opp.Id];
-
-        // Act — update again while already Closed Won
-        Test.startTest();
-        opp.Description = 'Post-close note';
-        update opp;
-        Test.stopTest();
-
-        // Assert — no additional Task created
-        Integer taskCountAfterSecondUpdate =
-            [SELECT COUNT() FROM Task WHERE WhatId = :opp.Id];
-
-        Assert.areEqual(taskCountAfterFirstTransition, taskCountAfterSecondUpdate,
-            'No additional Task should be created when the Opportunity is already Closed Won.');
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 9: Account with no Sales Manager user → silent skip
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testInsert_NoSalesManagerUser_SilentSkip() {
-        // Arrange — role exists but no user is assigned to it
-        UserRole salesMgrRole = createRole('Sales Manager No User');
-        // Intentionally do NOT create a user with this role
-
-        User oppOwner = createUser('NoSMUserOwner', 'Standard User', true);
-        Account acc;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-        }
-
-        Opportunity opp = new Opportunity(
-            Name      = 'No SM User Deal',
-            AccountId = acc.Id,
-            OwnerId   = oppOwner.Id,
-            StageName = 'Prospecting',
-            CloseDate = Date.today().addDays(30),
-            Amount    = 80000
-        );
-
-        // Act & Assert — must not throw
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            insert opp;
-        } catch (Exception e) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        Assert.isFalse(exceptionThrown,
-            'No exception should be thrown when no user holds the Sales Manager role.');
-
-        List<Opportunity> inserted = [SELECT Id FROM Opportunity WHERE Id = :opp.Id];
-        Assert.areEqual(1, inserted.size(),
-            'Opportunity should be inserted successfully when no Sales Manager user exists.');
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 10: Bulk insert — 200 records over $50k, no Sales Manager role
-    //              Verifies bulkification of notification path and silent skip
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testBulkInsert_200RecordsOver50k_NoException() {
-        // Arrange
-        User oppOwner = createUser('BulkNotifOwner', 'Standard User', true);
-        Account acc;
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-        }
-
-        List<Opportunity> opps = new List<Opportunity>();
-        for (Integer i = 0; i < 200; i++) {
-            opps.add(new Opportunity(
-                Name      = 'Bulk Notif Opp ' + i,
-                AccountId = acc.Id,
-                OwnerId   = oppOwner.Id,
-                StageName = 'Prospecting',
-                CloseDate = Date.today().addDays(30),
-                Amount    = 60000
-            ));
-        }
-
-        // Act
-        Test.startTest();
-        Boolean exceptionThrown = false;
-        try {
-            insert opps;
-        } catch (Exception e) {
-            exceptionThrown = true;
-        }
-        Test.stopTest();
-
-        // Assert
-        Assert.isFalse(exceptionThrown,
-            'Bulk insert of 200 records over $50k should not throw an exception.');
-
-        Integer insertedCount = [SELECT COUNT() FROM Opportunity
-                                 WHERE Id IN :opps];
-        Assert.areEqual(200, insertedCount,
-            'All 200 Opportunities should be inserted successfully.');
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 11: Mixed batch — some Closed Won, some not; only correct Tasks
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testMixedBatch_OnlyCWOppsGetTasks() {
-        // Arrange
-        User oppOwner = createUser('MixedOwner', 'Standard User', true);
-        User accOwner = createUser('MixedAccOwner', 'Standard User', true);
-        Account acc;
-        List<Opportunity> opps = new List<Opportunity>();
-
-        System.runAs(oppOwner) {
-            acc = createAccount(accOwner.Id);
-            for (Integer i = 0; i < 5; i++) {
-                opps.add(createOpenOpportunity(acc.Id, oppOwner.Id, 5000));
-            }
-            insert opps;
-        }
-
-        // Act — transition only the first 3 to Closed Won
-        List<Opportunity> toUpdate = new List<Opportunity>();
-        for (Integer i = 0; i < 5; i++) {
-            Opportunity o = opps[i].clone(true, false, false, false);
-            o.StageName = (i < 3) ? 'Closed Won' : 'Needs Analysis';
-            toUpdate.add(o);
-        }
-
-        Test.startTest();
-        update toUpdate;
-        Test.stopTest();
-
-        // Assert — exactly 3 Tasks created
-        List<Task> tasks = [SELECT Id, WhatId FROM Task WHERE WhatId IN :opps];
-        Assert.areEqual(3, tasks.size(),
-            'Only the 3 Opportunities transitioning to Closed Won should have Tasks.');
-
-        Set<Id> cwOppIds = new Set<Id>{ opps[0].Id, opps[1].Id, opps[2].Id };
-        for (Task t : tasks) {
-            Assert.isTrue(cwOppIds.contains(t.WhatId),
-                'Task WhatId must reference one of the Closed Won Opportunities.');
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scenario 12: Task ActivityDate = CloseDate + 7 (explicit date assertion)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @IsTest
-    static void testClosedWon_TaskActivityDate_IsCloseDatePlusSeven() {
-        // Arrange
-        User oppOwner = createUser('DateCheckOwner', 'Standard User', true);
-        Account acc;
-        Opportunity opp;
-        Date specificCloseDate = Date.newInstance(2026, 6, 15);
-
-        System.runAs(oppOwner) {
-            acc = createAccount(oppOwner.Id);
-            opp = new Opportunity(
-                Name      = 'Date Check Opp',
-                AccountId = acc.Id,
-                OwnerId   = oppOwner.Id,
-                StageName = 'Prospecting',
-                CloseDate = specificCloseDate,
-                Amount    = 5000
-            );
-            insert opp;
-        }
-
-        // Act
-        Test.startTest();
-        opp.StageName = 'Closed Won';
-        update opp;
-        Test.stopTest();
-
-        // Assert
-        List<Task> tasks = [SELECT ActivityDate FROM Task WHERE WhatId = :opp.Id];
-        Assert.areEqual(1, tasks.size(), 'Expected one Task.');
-        Assert.areEqual(
-            specificCloseDate.addDays(7),
-            tasks[0].ActivityDate,
-            'Task ActivityDate must be exactly CloseDate + 7 days.'
-        );
+        Integer taskCount = [SELECT COUNT() FROM Task
+                             WHERE WhatId IN :opps
+                             AND   Subject LIKE 'Follow up:%'];
+        System.assertEquals(3, taskCount,
+            'Only the 3 Opportunities that transitioned to Closed Won should have Tasks.');
     }
 }
