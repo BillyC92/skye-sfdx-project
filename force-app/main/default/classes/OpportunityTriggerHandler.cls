@@ -1,251 +1,258 @@
 /**
- * @description Trigger handler for Opportunity events. Implements stage-transition
- *              validation, amount-threshold enforcement, and notification dispatch
- *              for the Acme Corp sales process.
+ * OpportunityTriggerHandler
  *
- *              Follows the single-trigger-per-object pattern with a dedicated handler.
+ * Handler class for all Opportunity trigger business logic.
+ * Called exclusively by OpportunityTrigger — contains zero DML or SOQL inside loops.
  *
- * @author  Skieward Consulting
- * @date    2024-11-15
- * @group   Opportunity Management
+ * Responsibilities:
+ *   1. On Closed Won (insert or update transition): create a follow-up Task assigned
+ *      to the Account owner (falls back to Opportunity owner if Account owner is inactive).
+ *   2. On Amount > 50,000 (insert only): send a Custom Notification to all Users
+ *      whose UserRole is 'Sales Manager'.
+ *
+ * Prerequisites:
+ *   - Custom Notification Type with DeveloperName 'Opportunity_Alert' must exist in the org.
+ *     Deployment succeeds without it, but runtime notification calls will throw.
  */
 public with sharing class OpportunityTriggerHandler {
 
-    // ---------------------------------------------------------------------------
-    // Constants
-    // ---------------------------------------------------------------------------
+    // ─── Constants ────────────────────────────────────────────────────────────
 
-    private static final Decimal EXECUTIVE_APPROVAL_THRESHOLD = 500000.00;
-    private static final Decimal LARGE_DEAL_THRESHOLD         = 100000.00;
-
-    /** Allowed forward stage transitions (simplified Acme Corp sales process). */
-    private static final Map<String, Set<String>> VALID_STAGE_TRANSITIONS = new Map<String, Set<String>>{
-        'Prospecting'           => new Set<String>{ 'Qualification', 'Closed Lost' },
-        'Qualification'         => new Set<String>{ 'Needs Analysis', 'Closed Lost' },
-        'Needs Analysis'        => new Set<String>{ 'Value Proposition', 'Closed Lost' },
-        'Value Proposition'     => new Set<String>{ 'Id. Decision Makers', 'Closed Lost' },
-        'Id. Decision Makers'   => new Set<String>{ 'Perception Analysis', 'Closed Lost' },
-        'Perception Analysis'   => new Set<String>{ 'Proposal/Price Quote', 'Closed Lost' },
-        'Proposal/Price Quote'  => new Set<String>{ 'Negotiation/Review', 'Closed Lost' },
-        'Negotiation/Review'    => new Set<String>{ 'Closed Won', 'Closed Lost' }
-    };
-
-    // ---------------------------------------------------------------------------
-    // Trigger Entry Points
-    // ---------------------------------------------------------------------------
-
-    /**
-     * @description Executes before-insert logic.
-     * @param newOpps Trigger.new list.
-     */
-    public void handleBeforeInsert(List<Opportunity> newOpps) {
-        stampDefaultFields(newOpps);
-        validateAmountThresholds(newOpps);
-    }
-
-    /**
-     * @description Executes before-update logic.
-     * @param newOpps Trigger.new list.
-     * @param oldMap  Trigger.oldMap.
-     */
-    public void handleBeforeUpdate(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        validateStageTransitions(newOpps, oldMap);
-        validateAmountThresholds(newOpps);
-        flagLargeDealChanges(newOpps, oldMap);
-    }
-
-    /**
-     * @description Executes after-update logic (notifications, chatter posts).
-     * @param newOpps Trigger.new list.
-     * @param oldMap  Trigger.oldMap.
-     */
-    public void handleAfterUpdate(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        notifyOnClosedWon(newOpps, oldMap);
-        createStageChangeHistoryTasks(newOpps, oldMap);
-    }
-
-    // ---------------------------------------------------------------------------
-    // Before-Insert Helpers
-    // ---------------------------------------------------------------------------
-
-    /**
-     * @description Sets sensible defaults on new Opportunity records when values
-     *              are not provided by the user.
-     */
-    private void stampDefaultFields(List<Opportunity> newOpps) {
-        for (Opportunity opp : newOpps) {
-            if (opp.StageName == null) {
-                opp.StageName = 'Prospecting';
-            }
-
-            if (opp.CloseDate == null) {
-                opp.CloseDate = Date.today().addDays(90);
-            }
-
-            if (opp.LeadSource == null) {
-                opp.LeadSource = 'Web';
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // Before-Update Helpers
-    // ---------------------------------------------------------------------------
-
-    /**
-     * @description Validates that stage transitions follow the allowed Acme Corp
-     *              sales methodology. Prevents skipping stages or moving backwards
-     *              unless the target is "Closed Lost".
-     */
+    /** Stage name that triggers Task creation. */
     @TestVisible
-    private void validateStageTransitions(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        for (Opportunity opp : newOpps) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
+    private static final String CLOSED_WON_STAGE = 'Closed Won';
 
-            if (opp.StageName == oldOpp.StageName) {
-                continue;
+    /** Amount threshold above which Sales Manager notifications are sent. */
+    @TestVisible
+    private static final Decimal LARGE_OPP_THRESHOLD = 50000;
+
+    /** DeveloperName of the Custom Notification Type configured in Setup. */
+    @TestVisible
+    private static final String NOTIFICATION_TYPE_DEV_NAME = 'Opportunity_Alert';
+
+    /** Subject used on the auto-created follow-up Task. */
+    @TestVisible
+    private static final String TASK_SUBJECT = 'Follow up on Closed Won Opportunity';
+
+    /** UserRole Name used to identify Sales Managers for notifications. */
+    @TestVisible
+    private static final String SALES_MANAGER_ROLE_NAME = 'Sales Manager';
+
+    // ─── Public Entry Points ──────────────────────────────────────────────────
+
+    /**
+     * Called from the trigger's after insert context.
+     * Evaluates every new Opportunity for Closed Won and large-amount conditions.
+     *
+     * @param newList  Trigger.new cast to List<Opportunity>
+     */
+    public void handleAfterInsert(List<Opportunity> newList) {
+        List<Opportunity> closedWonOpps = new List<Opportunity>();
+        List<Opportunity> largeOpps     = new List<Opportunity>();
+
+        for (Opportunity opp : newList) {
+            if (opp.StageName == CLOSED_WON_STAGE) {
+                closedWonOpps.add(opp);
             }
-
-            // Allow admin overrides via custom permission (simplified: check profile)
-            if (isAdminBypass()) {
-                continue;
+            // Notify on insert only; Amount must be strictly greater than threshold
+            if (opp.Amount != null && opp.Amount > LARGE_OPP_THRESHOLD) {
+                largeOpps.add(opp);
             }
+        }
 
-            Set<String> allowedNextStages = VALID_STAGE_TRANSITIONS.get(oldOpp.StageName);
-
-            if (allowedNextStages == null) {
-                // Current stage is terminal (Closed Won / Closed Lost) — no transitions allowed
-                opp.StageName.addError(
-                    'Opportunity in stage "' + oldOpp.StageName + '" cannot be moved to another stage. ' +
-                    'Please clone the record if you need a new opportunity.'
-                );
-                continue;
-            }
-
-            if (!allowedNextStages.contains(opp.StageName)) {
-                opp.StageName.addError(
-                    'Invalid stage transition from "' + oldOpp.StageName + '" to "' +
-                    opp.StageName + '". Allowed next stages: ' +
-                    String.join(new List<String>(allowedNextStages), ', ') + '.'
-                );
-            }
+        if (!closedWonOpps.isEmpty()) {
+            createClosedWonTasks(closedWonOpps);
+        }
+        if (!largeOpps.isEmpty()) {
+            sendLargeOpportunityNotifications(largeOpps);
         }
     }
 
     /**
-     * @description Enforces amount thresholds. Opportunities above the executive
-     *              approval threshold require the Description field to be populated
-     *              (as a proxy for justification notes).
+     * Called from the trigger's after update context.
+     * Detects Opportunities that *transitioned* to Closed Won in this DML operation.
+     * Large-amount notifications are intentionally NOT re-sent on update.
+     *
+     * @param newList  Trigger.new cast to List<Opportunity>
+     * @param oldMap   Trigger.oldMap
      */
-    private void validateAmountThresholds(List<Opportunity> opps) {
-        for (Opportunity opp : opps) {
-            if (opp.Amount != null && opp.Amount >= EXECUTIVE_APPROVAL_THRESHOLD) {
-                if (String.isBlank(opp.Description)) {
-                    opp.Description.addError(
-                        'Opportunities of $' + EXECUTIVE_APPROVAL_THRESHOLD.setScale(0).toPlainString() +
-                        ' or more require a justification in the Description field.'
-                    );
+    public void handleAfterUpdate(List<Opportunity> newList, Map<Id, Opportunity> oldMap) {
+        List<Opportunity> closedWonTransitions = new List<Opportunity>();
+
+        for (Opportunity opp : newList) {
+            Opportunity oldOpp = oldMap.get(opp.Id);
+            // Only act on records that just became Closed Won — not ones already there
+            Boolean wasClosedWon = (oldOpp.StageName == CLOSED_WON_STAGE);
+            Boolean isClosedWon  = (opp.StageName   == CLOSED_WON_STAGE);
+
+            if (isClosedWon && !wasClosedWon) {
+                closedWonTransitions.add(opp);
+            }
+        }
+
+        if (!closedWonTransitions.isEmpty()) {
+            createClosedWonTasks(closedWonTransitions);
+        }
+    }
+
+    // ─── Private Business Logic ───────────────────────────────────────────────
+
+    /**
+     * Creates one follow-up Task per Closed Won Opportunity.
+     *
+     * Task owner resolution:
+     *   - Preferred: the owner of the Opportunity's related Account (if active).
+     *   - Fallback:  the Opportunity's own OwnerId when the Account owner is
+     *                inactive, the Opportunity has no Account, or the Account
+     *                cannot be found.
+     *
+     * All SOQL is performed once, outside any loop.
+     *
+     * @param closedWonOpps  Opportunities confirmed to be in Closed Won stage
+     */
+    private void createClosedWonTasks(List<Opportunity> closedWonOpps) {
+        // Collect AccountIds — some Opportunities may have no Account
+        Set<Id> accountIds = new Set<Id>();
+        for (Opportunity opp : closedWonOpps) {
+            if (opp.AccountId != null) {
+                accountIds.add(opp.AccountId);
+            }
+        }
+
+        // Single SOQL: fetch Account owners and their active status
+        Map<Id, Account> accountMap = new Map<Id, Account>();
+        if (!accountIds.isEmpty()) {
+            for (Account acc : [
+                SELECT Id, OwnerId, Owner.IsActive
+                FROM   Account
+                WHERE  Id IN :accountIds
+            ]) {
+                accountMap.put(acc.Id, acc);
+            }
+        }
+
+        // Build Task list — one per Opportunity
+        List<Task> tasksToInsert = new List<Task>();
+        for (Opportunity opp : closedWonOpps) {
+            Id taskOwnerId = opp.OwnerId; // default / fallback
+
+            if (opp.AccountId != null && accountMap.containsKey(opp.AccountId)) {
+                Account relatedAccount = accountMap.get(opp.AccountId);
+                if (relatedAccount.Owner.IsActive) {
+                    // Account owner is active — preferred assignee
+                    taskOwnerId = relatedAccount.OwnerId;
                 }
+                // If Account owner is inactive, taskOwnerId stays as Opp owner (fallback)
+            }
+
+            tasksToInsert.add(new Task(
+                Subject      = TASK_SUBJECT,
+                WhatId       = opp.Id,
+                OwnerId      = taskOwnerId,
+                Status       = 'Not Started',
+                Priority     = 'Normal',
+                ActivityDate = Date.today().addDays(7)
+            ));
+        }
+
+        if (!tasksToInsert.isEmpty()) {
+            try {
+                insert tasksToInsert;
+            } catch (DmlException ex) {
+                // Log and re-throw so the triggering transaction is not silently swallowed
+                System.debug(LoggingLevel.ERROR,
+                    'OpportunityTriggerHandler.createClosedWonTasks DML error: ' + ex.getMessage());
+                throw ex;
             }
         }
     }
 
     /**
-     * @description Flags opportunities where the Amount increased by more than 20%
-     *              in a single edit — adds a note to the Description for audit trail.
+     * Sends a Custom Notification to all active Users whose UserRole is 'Sales Manager'.
+     *
+     * Behaviour:
+     *   - If no UserRole named 'Sales Manager' exists, returns silently (no exception).
+     *   - If no active Users hold that role, returns silently.
+     *   - Notification is sent once per large Opportunity; each recipient receives
+     *     one notification per qualifying Opportunity.
+     *
+     * All SOQL is performed outside loops.
+     *
+     * @param largeOpps  Opportunities with Amount strictly greater than LARGE_OPP_THRESHOLD
      */
-    private void flagLargeDealChanges(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        for (Opportunity opp : newOpps) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
+    private void sendLargeOpportunityNotifications(List<Opportunity> largeOpps) {
+        // ── Step 1: Resolve the Custom Notification Type ──────────────────────
+        List<CustomNotificationType> notifTypes = [
+            SELECT Id
+            FROM   CustomNotificationType
+            WHERE  DeveloperName = :NOTIFICATION_TYPE_DEV_NAME
+            LIMIT  1
+        ];
 
-            if (opp.Amount == null || oldOpp.Amount == null || oldOpp.Amount == 0) {
-                continue;
+        if (notifTypes.isEmpty()) {
+            // Prerequisite not met — log a warning and exit gracefully
+            System.debug(LoggingLevel.WARN,
+                'OpportunityTriggerHandler: CustomNotificationType "' +
+                NOTIFICATION_TYPE_DEV_NAME + '" not found. Skipping notifications.');
+            return;
+        }
+        String notifTypeId = notifTypes[0].Id;
+
+        // ── Step 2: Find the Sales Manager role ───────────────────────────────
+        List<UserRole> salesManagerRoles = [
+            SELECT Id
+            FROM   UserRole
+            WHERE  Name = :SALES_MANAGER_ROLE_NAME
+            LIMIT  1
+        ];
+
+        if (salesManagerRoles.isEmpty()) {
+            System.debug(LoggingLevel.WARN,
+                'OpportunityTriggerHandler: UserRole "' +
+                SALES_MANAGER_ROLE_NAME + '" not found. Skipping notifications.');
+            return;
+        }
+        Id salesManagerRoleId = salesManagerRoles[0].Id;
+
+        // ── Step 3: Collect active Users with that role ───────────────────────
+        List<User> salesManagers = [
+            SELECT Id
+            FROM   User
+            WHERE  UserRoleId = :salesManagerRoleId
+            AND    IsActive   = TRUE
+        ];
+
+        if (salesManagers.isEmpty()) {
+            System.debug(LoggingLevel.INFO,
+                'OpportunityTriggerHandler: No active Users found with role "' +
+                SALES_MANAGER_ROLE_NAME + '". Skipping notifications.');
+            return;
+        }
+
+        Set<String> recipientIds = new Set<String>();
+        for (User u : salesManagers) {
+            recipientIds.add(u.Id);
+        }
+
+        // ── Step 4: Send one notification per large Opportunity ───────────────
+        for (Opportunity opp : largeOpps) {
+            try {
+                Messaging.CustomNotification notification = new Messaging.CustomNotification();
+                notification.setNotificationTypeId(notifTypeId);
+                notification.setTargetId(opp.Id);
+                notification.setTitle('Large Opportunity Alert');
+                notification.setBody(
+                    'Opportunity "' + opp.Name + '" has an amount of ' +
+                    opp.Amount.format() + ', exceeding the $' +
+                    LARGE_OPP_THRESHOLD.format() + ' threshold.'
+                );
+                notification.send(recipientIds);
+            } catch (Exception ex) {
+                // Notification failure must not roll back the Opportunity save
+                System.debug(LoggingLevel.ERROR,
+                    'OpportunityTriggerHandler.sendLargeOpportunityNotifications error for Opp ' +
+                    opp.Id + ': ' + ex.getMessage());
             }
-
-            Decimal percentChange = ((opp.Amount - oldOpp.Amount) / oldOpp.Amount) * 100;
-
-            if (percentChange > 20) {
-                String auditNote = '\n[Skieward Audit] Amount increased by ' +
-                    percentChange.setScale(1) + '% on ' + String.valueOf(Date.today()) + '.';
-
-                opp.Description = (String.isNotBlank(opp.Description) ? opp.Description : '') + auditNote;
-            }
         }
-    }
-
-    // ---------------------------------------------------------------------------
-    // After-Update Helpers
-    // ---------------------------------------------------------------------------
-
-    /**
-     * @description Sends a platform event or email notification when an Opportunity
-     *              moves to "Closed Won". In this implementation we create a Task
-     *              assigned to the Opportunity Owner for follow-up.
-     */
-    private void notifyOnClosedWon(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        List<Task> followUpTasks = new List<Task>();
-
-        for (Opportunity opp : newOpps) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
-
-            if (opp.StageName == 'Closed Won' && oldOpp.StageName != 'Closed Won') {
-                followUpTasks.add(new Task(
-                    Subject     = 'Closed Won Follow-Up: ' + opp.Name,
-                    WhatId      = opp.Id,
-                    OwnerId     = opp.OwnerId,
-                    Status      = 'Not Started',
-                    Priority    = opp.Amount >= LARGE_DEAL_THRESHOLD ? 'High' : 'Normal',
-                    ActivityDate = Date.today().addDays(3),
-                    Description = 'Congratulations on closing ' + opp.Name + '! ' +
-                                  'Please initiate the onboarding process within 3 business days.'
-                ));
-            }
-        }
-
-        if (!followUpTasks.isEmpty()) {
-            insert followUpTasks;
-        }
-    }
-
-    /**
-     * @description Creates a lightweight Task record to log every stage change,
-     *              providing a queryable audit trail without custom objects.
-     */
-    private void createStageChangeHistoryTasks(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        List<Task> historyTasks = new List<Task>();
-
-        for (Opportunity opp : newOpps) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
-
-            if (opp.StageName != oldOpp.StageName) {
-                historyTasks.add(new Task(
-                    Subject     = 'Stage Change: ' + oldOpp.StageName + ' → ' + opp.StageName,
-                    WhatId      = opp.Id,
-                    OwnerId     = opp.OwnerId,
-                    Status      = 'Completed',
-                    Priority    = 'Low',
-                    ActivityDate = Date.today(),
-                    Description = 'Automated stage-change log by Skieward trigger framework.'
-                ));
-            }
-        }
-
-        if (!historyTasks.isEmpty()) {
-            insert historyTasks;
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // Utility
-    // ---------------------------------------------------------------------------
-
-    /**
-     * @description Simplified admin bypass check. In production this would use
-     *              Custom Permissions or a Custom Metadata Type.
-     * @return Boolean true if the running user should bypass stage validation.
-     */
-    @TestVisible
-    private Boolean isAdminBypass() {
-        return FeatureManagement.checkPermission('Bypass_Opportunity_Stage_Validation');
     }
 }
