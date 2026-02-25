@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <CustomNotificationType xmlns="http://soap.sforce.com/2006/04/metadata">
-    <apiName>OpportunityFollowUpNotification</apiName>
+    <allowBrowserNotification>false</allowBrowserNotification>
+    <allowMobileNotification>true</allowMobileNotification>
+    <allowSlackNotification>false</allowSlackNotification>
     <customNotifTypeName>Opportunity Follow Up Notification</customNotifTypeName>
-    <description>Sends a custom notification to the Sales Manager when a new Opportunity over $50,000 is created. Used by OpportunityNotificationService to alert relevant stakeholders in real time.</description>
-    <desktop>true</desktop>
-    <mobile>true</mobile>
+    <description>Notification sent when a high-value Opportunity (Amount greater than $50,000) is created. Used by OpportunityNotificationService to alert relevant users via the Messaging.CustomNotification API.</description>
+    <masterLabel>Opportunity Follow Up Notification</masterLabel>
 </CustomNotificationType>

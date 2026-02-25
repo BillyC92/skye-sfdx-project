@@ -1,172 +1,231 @@
 /**
  * OpportunityNotificationService
  *
- * Responsible for sending in-app/mobile custom notifications to Sales Manager users
- * when a new Opportunity is created with an Amount greater than $50,000.
+ * Stateless service class responsible for sending custom notifications
+ * to Sales Managers when a high-value Opportunity (Amount > $50,000) is created.
  *
  * Design decisions:
- * - Accepts pre-queried data (Opportunities + Account map) so this class is
- *   stateless and independently testable without needing live DML in tests.
- * - Sales Manager role is looked up by UserRole.DeveloperName to avoid
- *   hardcoding any Salesforce IDs.
- * - All notification exceptions are caught and logged rather than re-thrown,
- *   so a notification failure never causes the originating trigger to roll back.
- * - The CustomNotificationType is referenced by DeveloperName ('Follow_Up_Notification')
- *   and must exist in the org before this class is invoked in production.
+ * - Called only on insert (after insert) — update notifications are intentionally excluded
+ *   per requirements. The handler enforces this; this class does not re-check context.
+ * - Silent failure: exceptions from the notification API are caught and logged via
+ *   System.debug rather than rethrown, so a notification failure never rolls back the
+ *   Opportunity DML that triggered it.
+ * - No SOQL inside loops. The UserRole query is performed once and cached in a local
+ *   variable. Account data is passed in from the handler to avoid redundant queries.
+ * - CustomNotificationType is looked up by DeveloperName so no Id is hardcoded.
  */
 public with sharing class OpportunityNotificationService {
 
-    // DeveloperName of the CustomNotificationType metadata record.
-    // Must match the record deployed under customNotifications/Follow_Up_Notification.customNotification
+    // Notification type developer name — matches the CustomNotificationType metadata record.
+    // Using a constant keeps the magic string in one place and makes future changes trivial.
     @TestVisible
-    private static final String NOTIFICATION_TYPE_DEV_NAME = 'Follow_Up_Notification';
+    private static final String NOTIFICATION_TYPE_DEV_NAME = 'OpportunityFollowUpNotification';
 
-    // DeveloperName of the UserRole representing Sales Managers.
-    // Using a constant keeps the value configurable in one place and avoids magic strings.
+    // Amount threshold above which a notification is sent.
     @TestVisible
-    private static final String SALES_MANAGER_ROLE_DEV_NAME = 'Sales_Manager';
+    private static final Decimal HIGH_VALUE_THRESHOLD = 50000;
 
     /**
-     * Sends a custom notification to all active Sales Manager users for every
-     * newly inserted Opportunity whose Amount exceeds $50,000.
+     * sendHighValueNotifications
      *
-     * @param newOpportunities  List of newly inserted Opportunity records (Trigger.new).
-     *                          Expected to include: Id, Name, Amount, OwnerId, Owner.Name, AccountId.
-     * @param accountById       Map of Account.Id -> Account (with owner data) pre-queried
-     *                          by the handler to avoid SOQL inside this service.
+     * Sends a custom notification to the Account owner (if they are a Sales Manager)
+     * for every Opportunity in newOpps whose Amount exceeds the high-value threshold.
+     *
+     * @param newOpps    List of newly inserted Opportunity records (Trigger.new).
+     * @param accountMap Map of Account Id -> Account (with OwnerId, Owner.UserRoleId populated)
+     *                   pre-fetched by the handler. May be empty but never null.
      */
-    public static void sendHighValueOpportunityNotifications(
-        List<Opportunity> newOpportunities,
-        Map<Id, Account> accountById
+    public static void sendHighValueNotifications(
+        List<Opportunity> newOpps,
+        Map<Id, Account> accountMap
     ) {
-        if (newOpportunities == null || newOpportunities.isEmpty()) {
+        if (newOpps == null || newOpps.isEmpty()) {
             return;
         }
 
-        // --- 1. Filter qualifying Opportunities up front ---
-        // Only process records with Amount > 50,000 to avoid unnecessary work.
-        List<Opportunity> qualifyingOpps = new List<Opportunity>();
-        for (Opportunity opp : newOpportunities) {
-            if (opp.Amount != null && opp.Amount > 50000) {
-                qualifyingOpps.add(opp);
+        // --- Step 1: Filter to high-value Opportunities only ---
+        List<Opportunity> highValueOpps = new List<Opportunity>();
+        for (Opportunity opp : newOpps) {
+            if (opp.Amount != null && opp.Amount > HIGH_VALUE_THRESHOLD) {
+                highValueOpps.add(opp);
             }
         }
 
-        if (qualifyingOpps.isEmpty()) {
+        if (highValueOpps.isEmpty()) {
             return;
         }
 
-        // --- 2. Resolve the CustomNotificationType Id ---
-        // We look this up at runtime so the class works across sandboxes and production
-        // without hardcoding an org-specific Id.
-        Id notificationTypeId = resolveNotificationTypeId();
-        if (notificationTypeId == null) {
-            // The CustomNotificationType hasn't been deployed yet — log and exit gracefully.
+        // --- Step 2: Look up the Sales Manager UserRole (single query, no loop) ---
+        // We query by DeveloperName so this works across sandboxes and production
+        // without hardcoding a Role Id.
+        UserRole salesManagerRole = null;
+        List<UserRole> roles = [
+            SELECT Id, DeveloperName
+            FROM UserRole
+            WHERE DeveloperName = 'Sales_Manager'
+            LIMIT 1
+        ];
+        if (!roles.isEmpty()) {
+            salesManagerRole = roles[0];
+        }
+
+        // If no Sales Manager role exists in this org, there is no valid recipient.
+        // Per requirements, skip silently — do not throw.
+        if (salesManagerRole == null) {
             System.debug(
                 LoggingLevel.WARN,
-                'OpportunityNotificationService: CustomNotificationType "' +
-                NOTIFICATION_TYPE_DEV_NAME +
-                '" not found. Notifications will not be sent.'
+                'OpportunityNotificationService: No UserRole with DeveloperName \'Sales_Manager\' ' +
+                'found. High-value notifications will not be sent.'
             );
             return;
         }
 
-        // --- 3. Resolve Sales Manager user Ids ---
-        // Query users whose role DeveloperName matches. If none exist, exit silently.
-        Set<Id> salesManagerUserIds = resolveSalesManagerUserIds();
-        if (salesManagerUserIds.isEmpty()) {
+        // --- Step 3: Look up the CustomNotificationType Id (single query) ---
+        // This Id is required by the Messaging.CustomNotification API.
+        CustomNotificationType notificationType = null;
+        List<CustomNotificationType> notifTypes = [
+            SELECT Id, DeveloperName
+            FROM CustomNotificationType
+            WHERE DeveloperName = :NOTIFICATION_TYPE_DEV_NAME
+            LIMIT 1
+        ];
+        if (!notifTypes.isEmpty()) {
+            notificationType = notifTypes[0];
+        }
+
+        if (notificationType == null) {
             System.debug(
-                LoggingLevel.INFO,
-                'OpportunityNotificationService: No active users found with role "' +
-                SALES_MANAGER_ROLE_DEV_NAME +
-                '". Skipping notifications.'
+                LoggingLevel.ERROR,
+                'OpportunityNotificationService: CustomNotificationType \'' +
+                NOTIFICATION_TYPE_DEV_NAME +
+                '\' not found. Ensure the metadata record has been deployed. ' +
+                'High-value notifications will not be sent.'
             );
             return;
         }
 
-        // --- 4. Send one notification per qualifying Opportunity ---
-        for (Opportunity opp : qualifyingOpps) {
-            String ownerName = opp.Owner != null ? opp.Owner.Name : 'Unknown';
-            String formattedAmount = formatCurrency(opp.Amount);
-
-            String notificationBody =
-                opp.Name + ' (' + formattedAmount + ') was just created by ' + ownerName;
-
-            // PageReference target: the Opportunity record page.
-            // Using a string page reference keeps this compatible with both Classic and LEX.
-            String targetPageRef =
-                '{"type":"standard__recordPage","attributes":{"recordId":"' +
-                opp.Id +
-                '","actionName":"view"}}';
-
+        // --- Step 4: Build and send notifications ---
+        // We iterate high-value Opps, resolve the Account owner, confirm they hold
+        // the Sales Manager role, then dispatch one notification per qualifying Opp.
+        //
+        // The Messaging.CustomNotification API does not support true bulk dispatch
+        // (each send() call targets one notification), so we call send() per record.
+        // Exceptions are caught individually so one failure does not block others.
+        for (Opportunity opp : highValueOpps) {
             try {
+                // Resolve the Account owner for this Opportunity.
+                Id accountOwnerId = resolveAccountOwnerId(opp, accountMap);
+
+                if (accountOwnerId == null) {
+                    System.debug(
+                        LoggingLevel.WARN,
+                        'OpportunityNotificationService: Could not resolve Account owner ' +
+                        'for Opportunity ' + opp.Id + ' (' + opp.Name + '). Skipping notification.'
+                    );
+                    continue;
+                }
+
+                // Confirm the Account owner holds the Sales Manager role.
+                // We look up the User's role via the accountMap's owner data.
+                // The handler must have queried Account with Owner.UserRoleId.
+                if (!isUserSalesManager(accountOwnerId, accountMap, salesManagerRole.Id)) {
+                    System.debug(
+                        LoggingLevel.DEBUG,
+                        'OpportunityNotificationService: Account owner ' + accountOwnerId +
+                        ' is not a Sales Manager. Skipping notification for Opp ' + opp.Id + '.'
+                    );
+                    continue;
+                }
+
+                // Build the notification.
                 Messaging.CustomNotification notification = new Messaging.CustomNotification();
-                notification.setNotificationTypeId(notificationTypeId);
-                notification.setTargetPageRef(targetPageRef);
+                notification.setNotificationTypeId(notificationType.Id);
+                notification.setTargetId(opp.Id);
                 notification.setTitle('High-Value Opportunity Created');
-                notification.setBody(notificationBody);
-                notification.send(salesManagerUserIds);
+                notification.setBody(
+                    'Opportunity \'' + opp.Name + '\' has been created with an amount of $' +
+                    formatAmount(opp.Amount) + '. Please review and take appropriate action.'
+                );
+
+                // Recipient set — one user per notification.
+                Set<String> recipientIds = new Set<String>{ accountOwnerId };
+                notification.send(recipientIds);
+
             } catch (Exception ex) {
-                // Catching broadly here is intentional: a notification failure must never
-                // roll back the Opportunity insert that triggered this service.
+                // Silent failure: log the error but do not rethrow.
+                // A notification failure must never roll back the Opportunity save.
                 System.debug(
                     LoggingLevel.ERROR,
-                    'OpportunityNotificationService: Failed to send notification for Opportunity "' +
-                    opp.Name + '" (Id: ' + opp.Id + '). Error: ' + ex.getMessage()
+                    'OpportunityNotificationService: Failed to send notification for ' +
+                    'Opportunity ' + opp.Id + '. Error: ' + ex.getMessage() +
+                    ' | Stack: ' + ex.getStackTraceString()
                 );
             }
         }
     }
 
-    // ---------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Private helpers
-    // ---------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     /**
-     * Looks up the Id of the Follow_Up_Notification CustomNotificationType.
-     * Returns null if the record does not exist in the org.
-     */
-    private static Id resolveNotificationTypeId() {
-        List<CustomNotificationType> types = [
-            SELECT Id
-            FROM CustomNotificationType
-            WHERE DeveloperName = :NOTIFICATION_TYPE_DEV_NAME
-            LIMIT 1
-        ];
-        return types.isEmpty() ? null : types[0].Id;
-    }
-
-    /**
-     * Returns the Ids of all active users whose UserRole has the Sales Manager
-     * DeveloperName. Returns an empty set if no matching users exist.
+     * resolveAccountOwnerId
      *
-     * Why query User directly (not UserRole then User)?
-     * A single query with a relationship filter is more governor-limit-friendly
-     * than two separate queries and avoids an in-memory join.
+     * Returns the OwnerId of the Account associated with the given Opportunity,
+     * using the pre-fetched accountMap. Returns null if the Account is not found
+     * in the map or the Opportunity has no AccountId.
      */
-    private static Set<Id> resolveSalesManagerUserIds() {
-        Set<Id> userIds = new Set<Id>();
-        for (User u : [
-            SELECT Id
-            FROM User
-            WHERE IsActive = TRUE
-              AND UserRole.DeveloperName = :SALES_MANAGER_ROLE_DEV_NAME
-        ]) {
-            userIds.add(u.Id);
+    private static Id resolveAccountOwnerId(
+        Opportunity opp,
+        Map<Id, Account> accountMap
+    ) {
+        if (opp.AccountId == null || accountMap == null) {
+            return null;
         }
-        return userIds;
+        Account acc = accountMap.get(opp.AccountId);
+        return (acc != null) ? acc.OwnerId : null;
     }
 
     /**
-     * Formats a Decimal as a USD currency string (e.g. 75000 -> '$75,000.00').
-     * Keeps the notification body human-readable without pulling in heavy
-     * formatting libraries.
+     * isUserSalesManager
+     *
+     * Checks whether the given userId is the owner of an Account in accountMap
+     * whose Owner.UserRoleId matches salesManagerRoleId.
+     *
+     * The handler is expected to have queried:
+     *   SELECT Id, OwnerId, Owner.UserRoleId FROM Account WHERE Id IN :accountIds
+     *
+     * We iterate the accountMap values to find the Account owned by this user
+     * and inspect their role. This avoids an additional SOQL query.
      */
-    private static String formatCurrency(Decimal amount) {
-        if (amount == null) {
-            return '$0.00';
+    private static Boolean isUserSalesManager(
+        Id userId,
+        Map<Id, Account> accountMap,
+        Id salesManagerRoleId
+    ) {
+        if (userId == null || accountMap == null || salesManagerRoleId == null) {
+            return false;
         }
-        // setScale ensures two decimal places; format() adds locale-aware grouping separators.
-        return '$' + amount.setScale(2).format();
+        for (Account acc : accountMap.values()) {
+            if (acc.OwnerId == userId) {
+                // Owner.UserRoleId is available when the handler queries with
+                // a relationship field: Owner.UserRoleId
+                return acc.Owner != null && acc.Owner.UserRoleId == salesManagerRoleId;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * formatAmount
+     *
+     * Formats a Decimal amount as a plain string with two decimal places.
+     * Keeps the notification body readable without importing a full formatter.
+     */
+    private static String formatAmount(Decimal amount) {
+        if (amount == null) {
+            return '0.00';
+        }
+        return amount.setScale(2).toPlainString();
     }
 }

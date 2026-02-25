@@ -1,43 +1,47 @@
 /**
  * OpportunityTrigger
  *
- * Single trigger for the Opportunity object. Contains zero logic — all behaviour
- * is delegated to OpportunityTriggerHandler so that logic remains testable,
- * maintainable, and easy to extend without touching the trigger itself.
+ * Single entry-point trigger for the Opportunity object.
+ * Enforces the one-trigger-per-object pattern — all business logic lives
+ * in OpportunityTriggerHandler. This trigger is intentionally thin:
+ * it only identifies the active context(s) and delegates immediately.
  *
- * Contexts registered:
- *   - before insert  : reserved for future use (e.g. field defaulting)
- *   - after insert   : Task creation + $50k notification (KAN-5)
- *   - before update  : reserved for future use (e.g. field validation)
- *   - after update   : Task creation on Closed Won transition (KAN-5)
+ * Contexts handled:
+ *   - before insert  : reserved for future field-defaulting / validation logic
+ *   - before update  : reserved for future field-defaulting / validation logic
+ *   - after insert   : Task creation for Opps inserted as Closed Won;
+ *                      high-value ($50k+) notification dispatch
+ *                      (both require record Ids, only available post-insert)
+ *   - after update   : Task creation for Opps that transition TO Closed Won;
+ *                      old/new comparison requires the after-update context
  *
- * DO NOT add logic directly to this file. Add a new method to
- * OpportunityTriggerHandler and call it from the appropriate context block.
+ * KAN-5 | OpportunityTrigger
  */
 trigger OpportunityTrigger on Opportunity (
     before insert,
-    after insert,
     before update,
+    after insert,
     after update
 ) {
-    OpportunityTriggerHandler handler = new OpportunityTriggerHandler(
-        Trigger.new,
-        Trigger.newMap,
-        Trigger.old,
-        Trigger.oldMap
-    );
+    OpportunityTriggerHandler handler = new OpportunityTriggerHandler();
 
     if (Trigger.isBefore) {
         if (Trigger.isInsert) {
-            handler.onBeforeInsert();
+            // Reserved for future before-insert logic (e.g. field defaults, validation)
+            handler.handleBeforeInsert(Trigger.new);
         } else if (Trigger.isUpdate) {
-            handler.onBeforeUpdate();
+            // Reserved for future before-update logic (e.g. field defaults, validation)
+            handler.handleBeforeUpdate(Trigger.new, Trigger.oldMap);
         }
     } else if (Trigger.isAfter) {
         if (Trigger.isInsert) {
-            handler.onAfterInsert();
+            // Task creation for Opps inserted directly as Closed Won
+            // High-value notification for Opps with Amount > $50k
+            handler.handleAfterInsert(Trigger.new);
         } else if (Trigger.isUpdate) {
-            handler.onAfterUpdate();
+            // Task creation for Opps that transitioned to Closed Won in this DML
+            // Old/new value comparison performed inside the handler
+            handler.handleAfterUpdate(Trigger.new, Trigger.oldMap);
         }
     }
 }
