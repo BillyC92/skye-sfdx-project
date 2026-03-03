@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomNotificationType xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiName>Opportunity_Alert</apiName>
+    <customNotifTypeName>Opportunity Alert</customNotifTypeName>
+    <description>Notification type used to alert Sales Managers when a large Opportunity (over $50,000) is created or updated. Required by OpportunityTriggerHandler for Messaging.CustomNotification.send() calls.</description>
+    <desktop>true</desktop>
+    <mobile>true</mobile>
+</CustomNotificationType>
