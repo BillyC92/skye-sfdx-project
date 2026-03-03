@@ -1,17 +1,15 @@
 /**
- * OpportunityTrigger
+ * @description Single trigger for the Opportunity object. Delegates all logic to
+ *              OpportunityTriggerHandler following Skieward's one-trigger-per-object pattern.
  *
- * Single, thin trigger on the Opportunity object.
- * Contains zero business logic — all logic lives in OpportunityTriggerHandler.
+ *              Contexts handled:
+ *                - before insert : field defaulting (stampDefaultFields) + amount validation
+ *                - after insert  : large-deal notifications for opps > $50k (KAN-5 AC #3–5)
+ *                - before update : stage-transition validation, amount validation, audit flags
+ *                - after update  : Closed Won follow-up tasks (KAN-5 AC #2), stage-history tasks
  *
- * Contexts handled:
- *   - before insert  : reserved for future before-save field defaulting
- *   - after insert   : task creation, notifications for new Closed Won / large opps
- *   - after update   : task creation, notifications on Closed Won transition / large opps
- *
- * Why a thin trigger?
- *   Keeping logic out of the trigger body makes the handler independently testable,
- *   easier to maintain, and avoids the "logic buried in trigger" anti-pattern.
+ * @author  Skieward Consulting
+ * @date    2024-11-15
  */
 trigger OpportunityTrigger on Opportunity (before insert, after insert, before update, after update) {
 
@@ -19,8 +17,9 @@ trigger OpportunityTrigger on Opportunity (before insert, after insert, before u
 
     if (Trigger.isBefore) {
         if (Trigger.isInsert) {
-            // Reserved for future before-insert logic (e.g. field defaulting).
-            // OpportunityTriggerHandler.handleBeforeInsert(Trigger.new);
+            handler.handleBeforeInsert(Trigger.new);
+        } else if (Trigger.isUpdate) {
+            handler.handleBeforeUpdate(Trigger.new, Trigger.oldMap);
         }
     }
 
