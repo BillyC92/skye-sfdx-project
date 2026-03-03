@@ -5,7 +5,7 @@
  * @author  Skieward Consulting
  * @date    2024-11-15
  */
-trigger OpportunityTrigger on Opportunity (before insert, before update, after update) {
+trigger OpportunityTrigger on Opportunity (before insert, after insert, before update, after update) {
 
     OpportunityTriggerHandler handler = new OpportunityTriggerHandler();
 
@@ -18,7 +18,9 @@ trigger OpportunityTrigger on Opportunity (before insert, before update, after u
     }
 
     if (Trigger.isAfter) {
-        if (Trigger.isUpdate) {
+        if (Trigger.isInsert) {
+            handler.handleAfterInsert(Trigger.new);
+        } else if (Trigger.isUpdate) {
             handler.handleAfterUpdate(Trigger.new, Trigger.oldMap);
         }
     }

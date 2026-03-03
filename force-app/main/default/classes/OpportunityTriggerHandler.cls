@@ -4,6 +4,7 @@
  *              for the Acme Corp sales process.
  *
  *              Follows the single-trigger-per-object pattern with a dedicated handler.
+ *              Business logic is delegated to OpportunityService (KAN-5).
  *
  * @author  Skieward Consulting
  * @date    2024-11-15
@@ -41,6 +42,16 @@ public with sharing class OpportunityTriggerHandler {
     public void handleBeforeInsert(List<Opportunity> newOpps) {
         stampDefaultFields(newOpps);
         validateAmountThresholds(newOpps);
+    }
+
+    /**
+     * @description Executes after-insert logic.
+     *              Sends custom in-app notifications for Opportunities over $50k
+     *              to the Sales Manager role user on the Account (KAN-5 AC #3–5).
+     * @param newOpps Trigger.new list.
+     */
+    public void handleAfterInsert(List<Opportunity> newOpps) {
+        OpportunityService.sendLargeDealNotifications(newOpps);
     }
 
     /**
@@ -178,33 +189,17 @@ public with sharing class OpportunityTriggerHandler {
     // ---------------------------------------------------------------------------
 
     /**
-     * @description Sends a platform event or email notification when an Opportunity
-     *              moves to "Closed Won". In this implementation we create a Task
-     *              assigned to the Opportunity Owner for follow-up.
+     * @description Creates a follow-up Task when an Opportunity transitions to Closed Won.
+     *
+     *              KAN-5 requirements:
+     *                - Subject  : "Follow up: {Opportunity Name}"
+     *                - Owner    : Account owner (active). Falls back to Opp owner if inactive.
+     *                - Due date : CloseDate + 7 days
+     *
+     *              Delegates to OpportunityService to keep this handler thin.
      */
     private void notifyOnClosedWon(List<Opportunity> newOpps, Map<Id, Opportunity> oldMap) {
-        List<Task> followUpTasks = new List<Task>();
-
-        for (Opportunity opp : newOpps) {
-            Opportunity oldOpp = oldMap.get(opp.Id);
-
-            if (opp.StageName == 'Closed Won' && oldOpp.StageName != 'Closed Won') {
-                followUpTasks.add(new Task(
-                    Subject     = 'Closed Won Follow-Up: ' + opp.Name,
-                    WhatId      = opp.Id,
-                    OwnerId     = opp.OwnerId,
-                    Status      = 'Not Started',
-                    Priority    = opp.Amount >= LARGE_DEAL_THRESHOLD ? 'High' : 'Normal',
-                    ActivityDate = Date.today().addDays(3),
-                    Description = 'Congratulations on closing ' + opp.Name + '! ' +
-                                  'Please initiate the onboarding process within 3 business days.'
-                ));
-            }
-        }
-
-        if (!followUpTasks.isEmpty()) {
-            insert followUpTasks;
-        }
+        OpportunityService.createClosedWonFollowUpTasks(newOpps, oldMap);
     }
 
     /**

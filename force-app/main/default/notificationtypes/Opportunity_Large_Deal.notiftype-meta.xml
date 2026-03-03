@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomNotificationType xmlns="http://soap.sforce.com/2006/04/metadata">
+    <customNotifTypeName>Opportunity_Large_Deal</customNotifTypeName>
+    <description>Sent to the Sales Manager when an Opportunity over $50,000 is created. Part of KAN-5 Meridian Sales Cloud automation.</description>
+    <desktop>true</desktop>
+    <mobile>true</mobile>
+    <masterLabel>Opportunity Large Deal Alert</masterLabel>
+</CustomNotificationType>
